@@ -1,0 +1,125 @@
+"""
+此模块用于从数据库获取已存在的计量结果，用于与Python脚本的计算结果进行比对。
+"""
+import pandas as pd
+from sqlalchemy.engine import Engine
+from sqlalchemy import text
+from typing import Dict, Any, Tuple
+
+NULL_EQUIVALENTS = ['', 'NA', 'N/A', 'NONE', 'NULL']
+
+def _get_certi_no_condition(certi_no: str, params: Dict) -> str:
+    """
+    Generates a standardized SQL condition for certi_no, treating various null-like strings as equivalent.
+    """
+    # Check if certi_no is a meaningful value or a null equivalent
+    if certi_no and certi_no.strip().upper() not in NULL_EQUIVALENTS:
+        condition = "AND certi_no = :certi_no"
+        params['certi_no'] = certi_no
+    else:
+        # If it's a null equivalent, match against all possible null/empty/'NA' values in the DB
+        condition = "AND (certi_no IS NULL OR certi_no = '' OR UPPER(certi_no) = 'NA')"
+    return condition
+
+def get_db_measure_result(engine: Engine, val_month: str, policy_no: str, certi_no: str) -> Dict[str, Any]:
+    """
+    从 measure_platform.measure_cx_unexpired 表中获取指定保单在评估月的已存计量结果。
+    """
+    params = {'val_month': val_month, 'policy_no': policy_no}
+    certi_no_condition = _get_certi_no_condition(certi_no, params)
+
+    sql = f"""
+    SELECT 
+        lrc_no_loss_amt,
+        lrc_loss_amt,
+        lrc_loss_cost_policy
+    FROM measure_platform.measure_cx_unexpired
+    WHERE val_month = :val_month
+      AND policy_no = :policy_no
+      {certi_no_condition}
+    ORDER BY update_time DESC
+    LIMIT 1;
+    """
+    try:
+        with engine.connect() as connection:
+            df = pd.read_sql(text(sql), connection, params=params)
+
+        if df.empty:
+            return {'lrc_no_loss_amt': '未找到', 'lrc_loss_amt': '未找到', 'lrc_loss_cost_policy': '未找到'}
+            
+        return df.iloc[0].to_dict()
+    except Exception as e:
+        print(f"Error fetching DB measure result: {e}")
+        return {'lrc_no_loss_amt': '查询失败', 'lrc_loss_amt': '查询失败', 'lrc_loss_cost_policy': '查询失败'}
+
+
+def get_db_reinsurance_measure_result(engine: Engine, val_month: str, contract_id: str, policy_no: str, certi_no: str) -> Dict[str, Any]:
+    """
+    Fetches the measure result from the database for a specific reinsurance contract.
+    Handles None or empty string for certi_no.
+    """
+    params = {'val_month': val_month, 'contract_id': contract_id, 'policy_no': policy_no}
+    certi_no_condition = _get_certi_no_condition(certi_no, params).replace("AND ", "") # Remove leading AND for this query structure
+
+    query = f"""
+    SELECT 
+        lrc_no_loss_amt,
+        lrc_loss_amt
+    FROM measure_platform.int_measure_cx_unexpired_rein
+    WHERE 
+        val_month = :val_month
+        AND contract_id = :contract_id
+        AND policy_no = :policy_no
+        AND {certi_no_condition}
+    ORDER BY update_time DESC
+    LIMIT 1
+    """
+    
+    try:
+        with engine.connect() as connection:
+            df = pd.read_sql(text(query), connection, params=params)
+        
+        if df.empty:
+            return {'lrc_no_loss_amt': '未找到', 'lrc_loss_amt': '未找到'}
+            
+        return df.iloc[0].to_dict()
+    except Exception as e:
+        print(f"Error fetching DB reinsurance measure result: {e}")
+        return {'lrc_no_loss_amt': '查询失败', 'lrc_loss_amt': '查询失败'}
+
+def get_db_reinsurance_outward_measure_result(engine: Engine, val_month: str, policy_no: str, certi_no: str) -> Dict[str, Any]:
+    """
+    Fetches the measure result from the database for a specific reinsurance outward policy.
+    从 int_measure_cx_unexpired_rein 表中获取再保分出计量结果 (val_method='10')
+    """
+    params = {'val_month': val_month, 'policy_no': policy_no}
+    certi_no_condition = _get_certi_no_condition(certi_no, params)
+
+    query = f"""
+    SELECT 
+        closing_balance,
+        loss_component,
+        lrc_debt
+    FROM measure_platform.int_measure_cx_unexpired_rein
+    WHERE 
+        val_month = :val_month
+        AND policy_no = :policy_no
+        {certi_no_condition}
+        AND val_method = '10'
+    ORDER BY update_time DESC
+    LIMIT 1
+    """
+    
+    try:
+        with engine.connect() as connection:
+            df = pd.read_sql(text(query), connection, params=params)
+        
+        if df.empty:
+            return {'closing_balance': '未找到', 'loss_component': '未找到', 'lrc_debt': '未找到'}
+            
+        return df.iloc[0].to_dict()
+    except Exception as e:
+        print(f"Error fetching DB reinsurance outward measure result: {e}")
+        return {'closing_balance': '查询失败', 'loss_component': '查询失败', 'lrc_debt': '查询失败'}
+
+
