@@ -4,7 +4,7 @@ from decimal import Decimal, ROUND_HALF_UP
 from typing import Tuple, List, Dict
 import datetime
 
-from test.core.data_fetcher import measure_input_data as fetcher
+from core.data_fetcher import measure_input_data as fetcher
 
 # --- 常量定义 ---
 # 设置Decimal的精度，确保与Java的BigDecimal行为一致
@@ -125,18 +125,10 @@ def _perform_monthly_rolling(contract_data, val_month, assumptions_map, discount
     except KeyError:
          raise ValueError(f"未在 assumptions_map 中找到 {ini_confirm_month_str}/{class_code} 的精算假设")
 
-    # 定义滚动累计变量 (使用Decimal)
-    cumulative_received_premiums = Decimal(0)
-    cumulative_premiums = Decimal(0)
-    cumulative_iacf = Decimal(0)
-    cumulative_ifie = Decimal(0)
-    opening_balance = Decimal(0)
-    served_days = 0
-
-    # --- 2. 修正逻辑: 在循环前一次性计算好总获取费用(摊销基础) 和 总现金流 ---
-    total_iacf_amt = Decimal(0) # 用于摊销的总基础
-    total_actual_iacf_cash_flow = Decimal(0) # 用于首期支出的总现金流
+    # --- 2. 准备费用数据 ---
+    total_iacf_amt = Decimal(0) # 用于摊销的总费用基础
     is_old_policy = ini_confirm_date < datetime.date(2024, 1, 1)
+    actuarial_iacf = Decimal(0)
     
     actuarial_iacf_log = ""
     if is_old_policy:
@@ -149,14 +141,33 @@ def _perform_monthly_rolling(contract_data, val_month, assumptions_map, discount
         except KeyError:
             raise ValueError(f"未在 assumptions_map 中找到老单 {ini_confirm_month_str}/{class_code} 的精算假设")
 
-    # 累加所有期间的实际费用到总额和总现金流
-    for amt in iacf_fol_map.values():
-        total_iacf_amt += Decimal(str(amt or 0))
-        total_actual_iacf_cash_flow += Decimal(str(amt or 0))
-    for amt in iacf_unfol_map.values():
-        total_iacf_amt += Decimal(str(amt or 0))
-        total_actual_iacf_cash_flow += Decimal(str(amt or 0))
+    # 按 202412 切分实际费用
+    historical_iacf = Decimal(0)
+    future_iacf_by_month = {}
+    
+    all_actual_iacf_by_month = {}
+    for month, amt in iacf_fol_map.items():
+        all_actual_iacf_by_month[month] = all_actual_iacf_by_month.get(month, Decimal(0)) + Decimal(str(amt or 0))
+    for month, amt in iacf_unfol_map.items():
+        all_actual_iacf_by_month[month] = all_actual_iacf_by_month.get(month, Decimal(0)) + Decimal(str(amt or 0))
 
+    for month, amt in all_actual_iacf_by_month.items():
+        if month <= '202412':
+            historical_iacf += amt
+        else:
+            future_iacf_by_month[month] = amt
+
+    # 将所有实际费用累加到摊销总额中
+    total_actual_iacf = historical_iacf + sum(future_iacf_by_month.values())
+    total_iacf_amt += total_actual_iacf
+
+    # --- 3. 初始化滚动变量 ---
+    cumulative_received_premiums = Decimal(0)
+    cumulative_premiums = Decimal(0)
+    cumulative_iacf = Decimal(0)
+    cumulative_ifie = Decimal(0)
+    opening_balance = Decimal(0)
+    served_days = 0
 
     period_map = _calculate_effective_days_in_period(ini_confirm_str, start_date, val_month, end_date)
 
@@ -180,12 +191,25 @@ def _perform_monthly_rolling(contract_data, val_month, assumptions_map, discount
         dis_rate = Decimal(str(init_month_rate_map.get(month_counter, 0) or 0))
         month_log["logs"].append(f"获取初始确认月({ini_confirm_month_str})的第 {month_counter} 个月远期利率: {dis_rate:.10f}")
         
-        # --- 新逻辑: 所有实际费用均在首期确认为现金流 ---
+        # --- 最终的、按月分配的现金流逻辑 (根据 202412 切分) ---
         iacf_cashflow_current = Decimal(0)
-        if month_counter == 1:
-            iacf_cashflow_current = total_actual_iacf_cash_flow
-            month_log["logs"].append(f"规则: 在初始确认月({month})，确认所有实际费用为现金流: {iacf_cashflow_current:.2f}")
         
+        # 规则1: 如果是首月，则计入所有历史费用 (<=202412) 和老单精算费用
+        if month_counter == 1:
+            iacf_cashflow_current += historical_iacf
+            month_log["logs"].append(f"规则1(首月): 计入202412及之前的实际费用现金流: {historical_iacf:.2f}")
+
+            # 如果是老单，再额外计入精算假设费用
+            if is_old_policy:
+                iacf_cashflow_current += actuarial_iacf
+                month_log["logs"].append(f"规则1.1(老单首月): 额外计入精算假设费用现金流: {actuarial_iacf:.2f}")
+
+        # 规则2: 如果当前月份晚于202412，则计入当月的实际费用
+        if month > '202412':
+            current_month_actual_iacf = future_iacf_by_month.get(month, Decimal(0))
+            iacf_cashflow_current += current_month_actual_iacf
+            month_log["logs"].append(f"规则2(>=202501): 计入当期({month})的实际费用现金流: {current_month_actual_iacf:.2f}")
+
         month_log["logs"].append(f" -> 当期最终获取费用现金流: {iacf_cashflow_current:.2f}")
 
         premium_cashflow = Decimal(str(paid_premiums_map.get(month, 0) or 0))
@@ -271,12 +295,28 @@ def _get_pv_maintenance(amt: Decimal, n: int, months_rate_map: Dict[int, object]
 
 
 def _get_pv_loss(amt: Decimal, n: int, claim_factor_arr: list, months_rate_map: Dict[int, object], val_month: str) -> Tuple[Decimal, pd.DataFrame]:
+    # This function is called by _perform_loss_test, which has a `loss_test_logs` object.
+    # It does not have a `logs` parameter to write to. I cannot add logs here without larger refactoring.
+    # The user wants to see logs. I will add print statements to stderr.
+    
+    import sys
+    print("\n--- 进入【直保专用】_get_pv_loss 函数 (版本: FINAL_DEBUG_20251111_V2) ---", file=sys.stderr)
+    print(f"  - 输入 amt (总额): {amt:.4f}", file=sys.stderr)
+    print(f"  - 输入 n (剩余月份): {n}", file=sys.stderr)
+    # Truncate for readability
+    print(f"  - 输入 claim_factor_arr (赔付模式, 前5个): {claim_factor_arr[:5]}", file=sys.stderr)
+
     if amt == Decimal(0) or n <= 0:
         return Decimal(0), pd.DataFrame()
         
     claim_factor = [Decimal(str(d)) for d in claim_factor_arr]
     avg_amt = (amt / Decimal(n)).quantize(TEN_DIGITS, rounding=ROUND_HALF_UP)
+    print(f"  - 计算 avg_amt (月均赔付): {avg_amt:.4f}", file=sys.stderr)
+
     claim_factor_applied = [(avg_amt * factor).quantize(TEN_DIGITS, rounding=ROUND_HALF_UP) for factor in claim_factor]
+    if claim_factor_applied:
+        print(f"  - 计算 claim_factor_applied[0] (首月现金流基数): {claim_factor_applied[0]:.4f}", file=sys.stderr)
+
     k, result_length = n - 1, len(claim_factor_applied) + n - 1
     result = [Decimal(0)] * result_length
     prefix = [Decimal(0)] * (len(claim_factor_applied) + 1)

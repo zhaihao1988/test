@@ -16,25 +16,34 @@ from sqlalchemy.engine import Engine
 from typing import List, Dict, Any, Tuple
 from io import StringIO
 
-from test.core.data_fetcher.reinsurance_outward_data import (
-    get_reinsurance_outward_data,
+from core.data_fetcher.reinsurance_outward_data import (
+    get_reinsurance_outward_source_data,
     get_reinsurance_outward_measure_prep_data,
-    get_underlying_loss_amount
+    get_all_reinsurance_outward_measure_records,
+    get_underlying_loss_amount,
+    get_invest_prop
 )
-from test.core.data_fetcher.reinsurance_input_data import (
-    get_reinsurance_assumptions,
-    get_reinsurance_discount_rates
+from core.data_fetcher.reinsurance_input_data import (
+    get_reinsurance_outward_assumptions,
+    get_reinsurance_discount_rates,
+    get_reinsurance_claim_models,
 )
+from core.data_fetcher.comparison_data import get_db_reinsurance_outward_measure_result
+
 
 SCALE = 10  # Decimal precision
 
 def _calculate_one_month_outward(
+    engine: Engine,
     val_month: str,
-    static_data: Dict[str, Any],
-    cash_flows: Dict[str, Decimal],
-    prev_result: Dict[str, Decimal],
-    assumptions: Dict[str, Any],
-    discount_rates: Dict[int, float]
+    static_data: dict,
+    cash_flows_for_month: dict,
+    prev_result: dict,
+    non_onerous_rate_curve: dict,
+    original_ini_confirm_month: str,
+    term_month: int,
+    rein_type: str,
+    loss_data: dict
 ) -> Tuple[Dict[str, Any], Dict[str, Decimal], str]:
     """
     Calculates all metrics for a single evaluation month for reinsurance outward.
@@ -46,29 +55,26 @@ def _calculate_one_month_outward(
     logs.write(f"\n--- 开始计算评估月: {val_month} ---\n")
     logs.write("步骤 1: 初始化数据\n")
     
-    # Extract static data
-    total_premium = D(static_data.get('premium', 0))
-    total_commission = D(static_data.get('commission', 0))
-    pi_start_date = static_data['pi_start_date']
-    pi_end_date = static_data['pi_end_date']
-    
-    # Cash flows for the current month (分出：保费和佣金都是支出，符号为负)
-    current_premium_cash_flow = cash_flows.get('premium', D(0))
-    current_commission_cash_flow = cash_flows.get('commission', D(0))
-    # 净保费 = 保费 - 佣金（对于分出，这是净支出）
+    # --- FIX: 使用 .get() 安全地从 Series 中提取值 ---
+    # 使用 .get(key, 0) or 0 的模式确保即使数据库返回None也能安全处理
+    current_premium_cash_flow = D(cash_flows_for_month.get('re_premium_cny_cash_flow', 0) or 0)
+    current_commission_cash_flow = D(cash_flows_for_month.get('re_commission_cny_cash_flow', 0) or 0)
     current_net_premium_cash_flow = current_premium_cash_flow - current_commission_cash_flow
     
     logs.write(f"  - 当期分出保费现金流: {current_premium_cash_flow:.4f}\n")
     logs.write(f"  - 当期分出佣金现金流: {current_commission_cash_flow:.4f}\n")
     logs.write(f"  - 当期净现金流 (保费 - 佣金): {current_net_premium_cash_flow:.4f}\n")
 
-    # Previous month's results
-    prev_lrc_no_loss = prev_result.get('lrc_no_loss_amt', D(0))
-    prev_acc_insurance_revenue = prev_result.get('acc_insurance_revenue', D(0))
-    prev_acc_ifie = prev_result.get('acc_ifie', D(0))
+    # 从上一轮结果中获取累计值
+    prev_lrc_no_loss = D(prev_result.get('lrc_no_loss_amt', 0))
+    prev_acc_insurance_revenue = D(prev_result.get('acc_insurance_revenue', 0))
+    prev_acc_investment_amortization = D(prev_result.get('acc_investment_amortization', 0))
+    prev_acc_income_before_splitting = D(prev_result.get('acc_income_before_splitting', 0))
+    prev_acc_ifie = D(prev_result.get('acc_ifie', 0))
 
     logs.write(f" -> 期初非亏损余额: {prev_lrc_no_loss:.4f}\n")
     logs.write(f" -> 上期累计确认收入: {prev_acc_insurance_revenue:.4f}\n")
+    logs.write(f" -> 上期累计投资成分摊销: {prev_acc_investment_amortization:.4f}\n")
     logs.write(f" -> 上期累计IFIE: {prev_acc_ifie:.4f}\n")
 
     # --- 2. Amortization Calculation ---
@@ -76,18 +82,40 @@ def _calculate_one_month_outward(
     val_date = datetime.strptime(val_month, '%Y%m').date()
     val_date = val_date.replace(day=monthrange(val_date.year, val_date.month)[1])
 
-    total_days = D((pi_end_date - pi_start_date).days + 1)
+    # --- FIX: Handle both Timestamp and date objects gracefully ---
+    pi_start_date_val = static_data.get('pi_start_date')
+    pi_end_date_val = static_data.get('pi_end_date')
+
+    pi_start_date_obj = pi_start_date_val.date() if hasattr(pi_start_date_val, 'date') else pi_start_date_val
+    pi_end_date_obj = pi_end_date_val.date() if hasattr(pi_end_date_val, 'date') else pi_end_date_val
+
+    total_days = D((pi_end_date_obj - pi_start_date_obj).days + 1)
     elapsed_days = D(0)
-    if val_date >= pi_start_date:
-        elapsed_days = D((min(val_date, pi_end_date) - pi_start_date).days + 1)
+    if val_date >= pi_start_date_obj:
+        elapsed_days = D((min(val_date, pi_end_date_obj) - pi_start_date_obj).days + 1)
     
     amortized_ratio = elapsed_days / total_days if total_days > 0 else D(0)
     logs.write(f"  累计服务天数: {elapsed_days} / {total_days}\n")
     logs.write(f"  -> 累计服务比例: {amortized_ratio:.10f}\n")
 
-    # --- 3. IFIE (Interest) Calculation ---
+    # --- 3. Investment Component Amortization ---
+    logs.write("\n【计算当期投资成分摊销】:\n")
+    acc_investment_amortization = (D(static_data.get('total_investment_component', 0)) * amortized_ratio).quantize(D(f'1e-{SCALE}'))
+    current_investment_amortization = (acc_investment_amortization - prev_acc_investment_amortization).quantize(D(f'1e-{SCALE}'))
+    logs.write(f"  公式: (总投资成分 * 累计服务比例) - 上期累计摊销\n")
+    logs.write(f"  = ({D(static_data.get('total_investment_component', 0)):.4f} * {amortized_ratio:.10f}) - {prev_acc_investment_amortization:.4f} = {current_investment_amortization:.4f}\n")
+    logs.write(f"  -> 累计投资成分摊销更新为: {acc_investment_amortization:.4f}\n")
+
+    # --- 4. IFIE (Interest) Calculation ---
     logs.write("\n【计算当期IFIE (未到期利息)】:\n")
-    monthly_rate = D(discount_rates.get(1, 0.0012))
+    
+    # This is the rate for non-onerous calculation (IFIE)
+    non_onerous_rate_float = non_onerous_rate_curve.get(term_month)
+    if non_onerous_rate_float is None:
+        logs.write(f"警告: 在锁定的初始确认月 '{original_ini_confirm_month}' 利率曲线中未找到第 {term_month} 期的利率, 将使用 0。\n")
+        non_onerous_rate_float = 0.0
+    non_onerous_rate_decimal = D(str(non_onerous_rate_float))
+    monthly_rate = non_onerous_rate_decimal
     ifie_from_opening_balance = prev_lrc_no_loss * monthly_rate
     ifie_from_net_premium = current_net_premium_cash_flow * monthly_rate * D('0.5')
     current_ifie = (ifie_from_opening_balance + ifie_from_net_premium).quantize(D(f'1e-{SCALE}'))
@@ -96,28 +124,39 @@ def _calculate_one_month_outward(
     logs.write(f"  = ({prev_lrc_no_loss:.4f} * {monthly_rate:.12f}) + ({current_net_premium_cash_flow:.4f} * {monthly_rate:.12f} * 0.5) = {current_ifie:.4f}\n")
     logs.write(f"  -> 累计IFIE更新为: {acc_ifie:.4f}\n")
 
-    # --- 4. Insurance Revenue (for outward, this is negative as it's ceded) ---
+    # --- 5. Insurance Revenue (for outward, this is negative as it's ceded) ---
     logs.write("\n【计算当期确认收入】:\n")
-    logs.write(f"  公式: ((总净保费 + 累计IFIE) * 累计服务比例) - 上期累计确认收入\n")
-    total_net_premium = total_premium - total_commission
-    acc_insurance_revenue = ((total_net_premium + acc_ifie) * amortized_ratio).quantize(D(f'1e-{SCALE}'))
-    current_insurance_revenue = (acc_insurance_revenue - prev_acc_insurance_revenue).quantize(D(f'1e-{SCALE}'))
-    logs.write(f"  = (({total_net_premium:.4f} + {acc_ifie:.4f}) * {amortized_ratio:.10f}) - {prev_acc_insurance_revenue:.4f} = {current_insurance_revenue:.4f}\n")
-    logs.write(f"  -> 累计确认收入更新为: {acc_insurance_revenue:.4f}\n")
+    total_net_premium = D(static_data.get('net_premium', 0) or 0)
 
-    # --- 5. Non-Onerous LRC Calculation ---
+    # 5.1 Calculate income before splitting investment component
+    logs.write("  步骤 5.1: 计算总分摊（分解投资成分前）\n")
+    acc_income_before_splitting = ((total_net_premium + acc_ifie) * amortized_ratio).quantize(D(f'1e-{SCALE}'))
+    current_income_before_splitting = (acc_income_before_splitting - prev_acc_income_before_splitting).quantize(D(f'1e-{SCALE}'))
+    logs.write(f"  - 公式: (总净保费 + 累计IFIE) * 累计服务比例\n")
+    logs.write(f"  - 累计总分摊(分解前): (({total_net_premium:.4f} + {acc_ifie:.4f}) * {amortized_ratio:.10f}) = {acc_income_before_splitting:.4f}\n")
+
+    # 5.2 Calculate final insurance revenue
+    logs.write("  步骤 5.2: 分解投资成分，计算实际保险服务收入\n")
+    acc_insurance_revenue = (acc_income_before_splitting - acc_investment_amortization).quantize(D(f'1e-{SCALE}'))
+    current_insurance_revenue = (acc_insurance_revenue - prev_acc_insurance_revenue).quantize(D(f'1e-{SCALE}'))
+    logs.write(f"  - 公式: 累计总分摊(分解前) - 累计投资成分摊销\n")
+    logs.write(f"  - 累计确认收入: {acc_income_before_splitting:.4f} - {acc_investment_amortization:.4f} = {acc_insurance_revenue:.4f}\n")
+    logs.write(f"  - 当期确认收入: {acc_insurance_revenue:.4f} - {prev_acc_insurance_revenue:.4f} = {current_insurance_revenue:.4f}\n")
+
+    # --- 6. Non-Onerous LRC Calculation ---
     logs.write("\n【计算期末非亏损余额】:\n")
-    logs.write(f"  公式: 期初余额 + 净现金流 + 当期IFIE - 当期确认收入\n")
+    logs.write(f"  公式: 期初余额 + 净现金流 + 当期IFIE - 当期确认收入 - 当期投资成分摊销\n")
     lrc_no_loss_amt = (
         prev_lrc_no_loss + 
         current_net_premium_cash_flow + 
         current_ifie - 
-        current_insurance_revenue
+        current_insurance_revenue -
+        current_investment_amortization
     ).quantize(D(f'1e-{SCALE}'))
-    logs.write(f"  = {prev_lrc_no_loss:.4f} + {current_net_premium_cash_flow:.4f} + {current_ifie:.4f} - {current_insurance_revenue:.4f} = {lrc_no_loss_amt:.4f}\n")
+    logs.write(f"  = {prev_lrc_no_loss:.4f} + {current_net_premium_cash_flow:.4f} + {current_ifie:.4f} - {current_insurance_revenue:.4f} - {current_investment_amortization:.4f} = {lrc_no_loss_amt:.4f}\n")
     logs.write(f"  -> 期末非亏损余额 (closing_balance) = {lrc_no_loss_amt:.4f}\n")
 
-    # --- 6. Final Results ---
+    # --- 7. Final Results ---
     result = {
         'val_month': val_month,
         'closing_balance': float(lrc_no_loss_amt),
@@ -125,6 +164,10 @@ def _calculate_one_month_outward(
         'current_insurance_revenue': float(current_insurance_revenue),
         'current_net_cash_flow': float(current_net_premium_cash_flow),
         'acc_insurance_revenue': float(acc_insurance_revenue),
+        'acc_income_before_splitting': float(acc_income_before_splitting),
+        'current_income_before_splitting': float(current_income_before_splitting),
+        'acc_investment_amortization': float(acc_investment_amortization),
+        'current_investment_amortization': float(current_investment_amortization),
         'acc_ifie': float(acc_ifie),
         'amortized_ratio': float(amortized_ratio),
         'current_ifie': float(current_ifie),
@@ -134,56 +177,52 @@ def _calculate_one_month_outward(
     internal_result_for_next_loop = {
         'lrc_no_loss_amt': lrc_no_loss_amt,
         'acc_insurance_revenue': acc_insurance_revenue,
+        'acc_investment_amortization': acc_investment_amortization,
+        'acc_income_before_splitting': acc_income_before_splitting,
         'acc_ifie': acc_ifie,
     }
     
     return result, internal_result_for_next_loop, logs.getvalue()
 
-def build_reinsurance_outward_cost_timeline(original_record: pd.Series, measure_prep_record: pd.Series) -> pd.DataFrame:
+def build_reinsurance_outward_cost_timeline(
+    measure_prep_record: pd.Series,
+    initial_booking_month: str
+) -> pd.DataFrame:
     """
-    Builds a timeline of costs for a reinsurance outward contract.
-    构建再保分出的费用时间线（只有保费和佣金）
+    Builds the cash flow timeline based on the single, latest measure prep record.
+    All cash flows are booked to the initial_booking_month.
     """
     timeline = {}
     D = Decimal
 
-    # Use ini_confirm from measure prep data
-    ini_confirm = measure_prep_record.get('ini_confirm')
-    if pd.notna(ini_confirm):
-        if isinstance(ini_confirm, str):
-            ini_confirm_month = ini_confirm[:6]  # YYYYMM format
-        else:
-            ini_confirm_month = ini_confirm.strftime('%Y%m')
-            
-        if ini_confirm_month not in timeline:
-            timeline[ini_confirm_month] = {'premium': D(0), 'commission': D(0)}
-        
-        # Amounts from measure prep record
-        timeline[ini_confirm_month]['premium'] += D(measure_prep_record.get('premium', 0) or 0)
-        timeline[ini_confirm_month]['commission'] += D(measure_prep_record.get('commission', 0) or 0)
+    # All cash flows (premium and commission) from the single record are booked to the initial month.
+    premium_flow = D(measure_prep_record.get('premium', 0) or 0)
+    commission_flow = D(measure_prep_record.get('commission', 0) or 0)
+
+    if premium_flow != 0 or commission_flow != 0:
+        timeline[initial_booking_month] = {
+            'premium': premium_flow,
+            'commission': commission_flow
+        }
 
     if not timeline:
         return pd.DataFrame(columns=['month', 'premium', 'commission'])
 
-    # Convert to DataFrame
     timeline_df = pd.DataFrame.from_dict(timeline, orient='index').reset_index()
     timeline_df = timeline_df.rename(columns={'index': 'month'})
     
-    # Ensure all columns are present
-    for col in ['premium', 'commission']:
-        if col not in timeline_df.columns:
-            timeline_df[col] = D(0)
-            
     return timeline_df.sort_values(by='month').reset_index(drop=True)
+
 
 def calculate_reinsurance_outward_unexpired_measure(
     engine: Engine,
     measure_val_month: str,
     policy_no: str,
-    certi_no: str
+    certi_no: str,
+    contract_id: str
 ) -> Tuple[List[Dict[str, Any]], pd.DataFrame, pd.DataFrame, Dict[str, Any]]:
     """
-    Orchestrates the month-by-month calculation for reinsurance outward LRC.
+    Orchestrates the new month-by-month calculation for reinsurance LRA for a specific contract_id.
     
     Returns:
         - calculation_logs: 逐月计算日志
@@ -191,30 +230,47 @@ def calculate_reinsurance_outward_unexpired_measure(
         - cashflow_df: 费用时间线
         - loss_info: 亏损信息字典
     """
+    D = Decimal
     main_logs = StringIO()
+    loss_info = {} # Initialize to prevent UnboundLocalError
     calculation_logs = []
     final_result_df = pd.DataFrame()
+    rein_type = '1' # Default value
+    discount_rates_map = {} # Initialize to prevent UnboundLocalError
+    months_to_calculate = [] # Initialize to prevent UnboundLocalError
 
     # --- 1. Data Fetching ---
     main_logs.write("步骤 1: 获取计量所需数据...\n")
     try:
-        original_df = get_reinsurance_outward_data(engine, policy_no, certi_no)
-        measure_prep_df = get_reinsurance_outward_measure_prep_data(engine, policy_no, certi_no)
-
-        if original_df.empty:
-            raise ValueError(f"在 'bi_to_cas25.ri_pp_re_mon_arr' 中未找到保单 '{policy_no}' 批单 '{certi_no}' 的原始记录。")
+        # Step 1.1: Fetch the single, latest measure prep record. This is the source of truth.
+        measure_prep_df = get_reinsurance_outward_measure_prep_data(engine, policy_no, certi_no, contract_id)
         if measure_prep_df.empty:
-            raise ValueError(f"在 'public.int_t_pp_re_mon_arr_new' 中未找到保单 '{policy_no}' 批单 '{certi_no}' 的计量准备数据。")
+            raise ValueError(f"在计量准备表 'public.int_t_pp_re_mon_arr_new' 中未找到合约 '{contract_id}' 的记录。")
+        
+        # This single record is our static data for the entire calculation
+        static_data = measure_prep_df.iloc[0].copy()
+        main_logs.write("  - 成功获取最新的计量准备数据。\n")
 
-        original_record = original_df.iloc[0]
-        measure_prep_record = measure_prep_df.iloc[0]
-        main_logs.write("  - 成功获取原始记录和计量准备数据。\n")
-        
-        # Combine into a single static data object
-        static_data = {**original_record.to_dict(), **measure_prep_record.to_dict()}
-        
+        # --- FIX: Manually calculate and add 'net_premium' to static_data ---
+        # The downstream calculator expects 'net_premium' for the amortization base.
+        static_data['net_premium'] = D(static_data.get('premium', 0) or 0) - D(static_data.get('commission', 0) or 0)
+        main_logs.write(f"  - 计算总净保费 (摊销基数): {static_data['net_premium']:.4f}\n")
+
+        # --- NEW: Fetch invest_prop and calculate total_investment_component ---
+        invest_prop = get_invest_prop(engine, policy_no, certi_no, contract_id)
+        total_premium = D(static_data.get('premium', 0) or 0)
+        static_data['total_investment_component'] = (total_premium * invest_prop).quantize(D(f'1e-{SCALE}'))
+        main_logs.write(f"  - 获取投资成分比例: {invest_prop:.4f}\n")
+        main_logs.write(f"  - 计算总投资成分: {static_data['total_investment_component']:.4f}\n")
+
         # Get rein_type to determine where to fetch loss from
         rein_type = static_data.get('rein_type', '1')
+
+        # Step 1.2: Fetch all historical results for lookups (e.g., previous balances)
+        all_measure_records_df = get_all_reinsurance_outward_measure_records(
+            engine, policy_no, certi_no, contract_id
+        )
+        main_logs.write(f"  - 成功获取所有历史计算结果 ({len(all_measure_records_df)} 条记录)。\n")
 
     except Exception as e:
         main_logs.write(f"数据获取失败: {e}\n")
@@ -224,20 +280,23 @@ def calculate_reinsurance_outward_unexpired_measure(
     # --- 2. Generate Timeline ---
     main_logs.write("步骤 2: 生成计算时间轴...\n")
     try:
-        ini_confirm = static_data.get('ini_confirm')
-        if not ini_confirm or pd.isna(ini_confirm):
-            raise ValueError("'ini_confirm' 在计量准备数据中为空，无法确定起始计算月份。")
+        # Get all required discount rates once
+        discount_rates_map = get_reinsurance_discount_rates(engine)
 
-        # Parse ini_confirm
-        if isinstance(ini_confirm, str):
-            if len(ini_confirm) >= 6:
-                start_month_str = ini_confirm[:6]
-            else:
-                start_month_str = ini_confirm
-            start_month_dt = datetime.strptime(start_month_str, '%Y%m').date().replace(day=1)
-        else:
-            start_month_dt = ini_confirm.replace(day=1)
-        
+        # --- NEW LOGIC: Determine the effective start month ---
+        ini_confirm = static_data.get('ini_confirm')
+        pi_start_date = static_data.get('pi_start_date')
+        if pd.isna(ini_confirm) or pd.isna(pi_start_date):
+            raise ValueError("'ini_confirm' or 'pi_start_date' is missing and cannot determine start month.")
+
+        # The effective start date is the later of ini_confirm and pi_start_date
+        effective_start_date = max(pd.to_datetime(ini_confirm), pd.to_datetime(pi_start_date))
+        initial_booking_month = effective_start_date.strftime('%Y%m')
+        main_logs.write(f"  - 初始确认日: {pd.to_datetime(ini_confirm).strftime('%Y-%m-%d')}, 责任起期: {pd.to_datetime(pi_start_date).strftime('%Y-%m-%d')}\n")
+        main_logs.write(f"  - 初始计量月 (取孰晚): {initial_booking_month}\n")
+
+        # The calculation timeline starts from the initial booking month.
+        start_month_dt = effective_start_date.to_pydatetime().date().replace(day=1)
         end_month_dt = datetime.strptime(measure_val_month, '%Y%m').date().replace(day=1)
         
         if start_month_dt > end_month_dt:
@@ -245,23 +304,53 @@ def calculate_reinsurance_outward_unexpired_measure(
 
         # Generate list of months to calculate
         months_to_calculate = []
-        current_dt = start_month_dt
-        while current_dt <= end_month_dt:
-            months_to_calculate.append(current_dt.strftime('%Y%m'))
-            current_dt += relativedelta(months=1)
-
+        current_month_dt = start_month_dt
+        while current_month_dt <= end_month_dt:
+            months_to_calculate.append(current_month_dt.strftime('%Y%m'))
+            current_month_dt += relativedelta(months=1)
+        
         main_logs.write(f"  - 计算期间: 从 {months_to_calculate[0]} 到 {months_to_calculate[-1]}\n")
 
-        # Build cash flow timeline
-        cashflow_df = build_reinsurance_outward_cost_timeline(original_record, measure_prep_record)
+        # --- NEW LOGIC: Lock in rate curve based on original ini_confirm month for IFIE ---
+        original_ini_confirm_month = pd.to_datetime(static_data.get('ini_confirm')).strftime('%Y%m')
+        locked_in_rate_curve = discount_rates_map.get(original_ini_confirm_month)
+        if not locked_in_rate_curve:
+            raise ValueError(f"在利率表中未找到用于锁定IFIE计算的初始确认月 '{original_ini_confirm_month}' 的利率曲线。")
+        main_logs.write(f"  - 利率曲线 (用于IFIE) 锁定于初始确认月: {original_ini_confirm_month}\n")
+
+        # --- Get all discount rates once ---
+        try:
+            all_discount_rates = get_reinsurance_discount_rates(engine)
+            locked_in_rate_curve = all_discount_rates.get(original_ini_confirm_month)
+
+            # --- DIAGNOSTIC LOG ---
+            if locked_in_rate_curve:
+                # Format the first 5 rates for logging to see what we actually got
+                rates_preview = {k: v for k, v in list(locked_in_rate_curve.items())[:5]}
+                main_logs.write(f"  - [DIAGNOSIS] 实际锁定的 '{original_ini_confirm_month}' 利率曲线内容 (前5期): {rates_preview}\n")
+            else:
+                main_logs.write(f"  - [DIAGNOSIS] 警告: 未能加载 '{original_ini_confirm_month}' 的锁定利率曲线。\n")
+            # --- END DIAGNOSTIC LOG ---
+
+            if not locked_in_rate_curve:
+                raise ValueError(f"在利率表中未找到初始确认月 '{original_ini_confirm_month}' 的利率曲线。")
+        except Exception as e:
+            main_logs.write(f"锁定利率曲线失败: {e}\n")
+            calculation_logs.append({'month': 'N/A', 'result_df': None, 'logs': [main_logs.getvalue()]})
+            return calculation_logs, final_result_df, pd.DataFrame(), {}
+
+        original_ini_confirm_dt = pd.to_datetime(static_data.get('ini_confirm')).to_pydatetime().date().replace(day=1)
+
+        # Build cash flow timeline based on the single measure_prep record
+        cashflow_df = build_reinsurance_outward_cost_timeline(static_data, initial_booking_month)
         
         # Create cash flow map by month
         cash_flows_map = {}
         for _, row in cashflow_df.iterrows():
             month = row['month']
             cash_flows_map[month] = {
-                'premium': Decimal(str(row['premium'])),
-                'commission': Decimal(str(row['commission']))
+                're_premium_cny_cash_flow': Decimal(str(row['premium'])),
+                're_commission_cny_cash_flow': Decimal(str(row['commission']))
             }
 
     except Exception as e:
@@ -269,48 +358,52 @@ def calculate_reinsurance_outward_unexpired_measure(
         calculation_logs.append({'month': 'N/A', 'result_df': None, 'logs': [main_logs.getvalue()]})
         return calculation_logs, final_result_df, pd.DataFrame(), {}
 
+    # --- Get Direct Insurance Loss Component ---
+    from core.data_fetcher.reinsurance_input_data import get_direct_insurance_loss_map
+    try:
+        main_logs.write(f"  - 开始获取底层直保业务的亏损金额...\n")
+        direct_insurance_loss_map = get_direct_insurance_loss_map(engine, policy_no, certi_no)
+        loss_info['direct_insurance_loss_map'] = {k: str(v) for k, v in direct_insurance_loss_map.items()} # for logging
+        main_logs.write(f"  - 成功获取直保亏损金额。\n")
+    except Exception as e:
+        main_logs.write(f"获取直保亏损金额失败: {e}\n")
+        # Continue with empty map
+        direct_insurance_loss_map = {}
+
+
     # --- 3. Month-by-Month Calculation ---
     main_logs.write("步骤 3: 开始逐月计算...\n")
     previous_month_result_internal = {}
     
-    # Fetch all assumptions and rates at once before the loop
-    try:
-        val_method = static_data.get('val_method', '10')
-        if not val_method:
-            val_method = '10'
-            main_logs.write("  - 警告: 'val_method' 在计量准备数据中为空, 使用默认值 '10'。\n")
-
-        all_assumptions = get_reinsurance_assumptions(engine, val_method)
-        all_discount_rates = get_reinsurance_discount_rates(engine)
-        main_logs.write(f"  - 成功获取所有精算假设 (评估方法 '{val_method}') 和折现率。\n")
-    except Exception as e:
-        main_logs.write(f"获取精算假设或折现率失败: {e}\n")
-        calculation_logs.append({'month': 'N/A', 'result_df': None, 'logs': [main_logs.getvalue()]})
-        return calculation_logs, final_result_df, pd.DataFrame(), {}
-
+    # 1. 一次性获取所有需要的数据
+    assumptions_map = get_reinsurance_outward_assumptions(engine)
+    claim_model_map = get_reinsurance_claim_models(engine)
+    
     all_monthly_results = []
     loss_info = {} # Initialize to store the last loss_info for the return value
 
-    for val_month in months_to_calculate:
-        month_cash_flows = cash_flows_map.get(val_month, {})
+    for i, current_month_str in enumerate(months_to_calculate):
         
-        # Get the specific assumptions and rates for the current month
-        class_code = static_data.get('class_code', 'default')
-        current_assumptions = all_assumptions.get(val_month, {}).get(class_code, {})
-        current_discount_rates = all_discount_rates.get(val_month, {})
+        # Get cash flows for the current month
+        cash_flows_for_month = cash_flows_map.get(current_month_str, {})
 
-        if not current_assumptions:
-            main_logs.write(f"警告: 在评估月 {val_month} 未找到险类 '{class_code}' 的精算假设。\n")
-        if not current_discount_rates:
-            main_logs.write(f"警告: 在评估月 {val_month} 未找到折现率。\n")
-            
+        current_val_dt = datetime.strptime(current_month_str, '%Y%m').date().replace(day=1)
+        term_month = (current_val_dt.year - original_ini_confirm_dt.year) * 12 + (current_val_dt.month - original_ini_confirm_dt.month) + 1
+
+        # Get loss data for the current month from direct insurance results
+        loss_data = direct_insurance_loss_map.get(current_month_str)
+
         result_for_df, next_prev_result, month_logs_str = _calculate_one_month_outward(
-            val_month,
+            engine,
+            current_month_str,
             static_data,
-            month_cash_flows,
+            cash_flows_for_month,
             previous_month_result_internal,
-            current_assumptions,
-            current_discount_rates
+            locked_in_rate_curve,
+            original_ini_confirm_month,
+            term_month,
+            rein_type,
+            loss_data
         )
         
         # --- Get Loss Component for the CURRENT month ---
@@ -322,7 +415,7 @@ def calculate_reinsurance_outward_unexpired_measure(
                 policy_no=policy_no,
                 certi_no=lookup_certi_no,
                 rein_type=rein_type,
-                val_month=val_month # Match on the same evaluation month
+                val_month=current_month_str # Match on the same evaluation month
             )
             
             if loss_info['loss_amount'] not in ['未找到', '查询失败']:
@@ -342,7 +435,7 @@ def calculate_reinsurance_outward_unexpired_measure(
         all_monthly_results.append(result_for_df)
 
         # --- Update Logs for the current month ---
-        full_log_list = [f"--- 开始计算评估月: {val_month} ---", month_logs_str]
+        full_log_list = [f"--- 开始计算评估月: {current_month_str} ---", month_logs_str]
         log_loss_str = StringIO()
         log_loss_str.write("\n【获取亏损部分】:\n")
         if loss_info.get('loss_amount') not in ['未找到', '查询失败'] and '查询失败' not in str(loss_info.get('loss_amount')):
@@ -356,7 +449,7 @@ def calculate_reinsurance_outward_unexpired_measure(
         full_log_list.append(log_loss_str.getvalue())
         
         calculation_logs.append({
-            'month': val_month,
+            'month': current_month_str,
             'result_df': pd.DataFrame([result_for_df]),
             'logs': full_log_list
         })

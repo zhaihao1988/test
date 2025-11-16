@@ -1,9 +1,10 @@
 import pandas as pd
 from sqlalchemy.engine import Engine
 from sqlalchemy import text
+import sys
 from datetime import datetime
 
-from test.core.data_fetcher.financial_data import get_actuarial_assumption
+from core.data_fetcher.financial_data import get_actuarial_assumption
 
 
 def build_iacf_timeline(
@@ -64,26 +65,48 @@ def build_iacf_timeline(
     timeline_df['actuarial_iacf'] = 0.0
 
     # 4. 如果是旧单，计算并添加精算假设费用
-    is_old_policy = ini_confirm_date and ini_confirm_date < datetime(2024, 1, 1).date()
+    print("--- IACF DEBUG START ---", file=sys.stderr)
+    print(f"[DEBUG] Input ini_confirm_date: {ini_confirm_date} (Type: {type(ini_confirm_date)})", file=sys.stderr)
+    
+    # 确保 ini_confirm_date 是 date 对象，以便比较
+    effective_ini_confirm_date = ini_confirm_date
+    if hasattr(ini_confirm_date, 'date'): # 处理 pandas Timestamp 对象
+        effective_ini_confirm_date = ini_confirm_date.date()
+
+    is_old_policy = effective_ini_confirm_date and effective_ini_confirm_date < datetime(2024, 1, 1).date()
+    print(f"[DEBUG] Is old policy? {is_old_policy}", file=sys.stderr)
+
     if is_old_policy:
-        ini_confirm_month = ini_confirm_date.strftime('%Y%m')
-        actuarial_rate = get_actuarial_assumption(engine, class_code, ini_confirm_month)
+        ini_confirm_month = effective_ini_confirm_date.strftime('%Y%m')
+        print(f"[DEBUG] Calculating for month: {ini_confirm_month}", file=sys.stderr)
+        
+        actuarial_rate = get_actuarial_assumption(engine, class_code, ini_confirm_month, val_method='8')
+        print(f"[DEBUG] Fetched actuarial_rate: {actuarial_rate}", file=sys.stderr)
+
         actuarial_iacf = (premium_cny or 0) * actuarial_rate
+        print(f"[DEBUG] Calculated actuarial_iacf: {actuarial_iacf} = {premium_cny or 0} * {actuarial_rate}", file=sys.stderr)
 
-        actuarial_row = pd.DataFrame({
-            'val_month': ['202312'],
-            'iacf_fol_cny': [0.0],
-            'iacf_unfol_amt': [0.0],
-            'iacf_fol_tax': [0.0],
-            'actuarial_iacf': [actuarial_iacf]
-        })
-        if not timeline_df.empty:
-            timeline_df = pd.concat([actuarial_row, timeline_df], ignore_index=True)
+        # 检查初始确认月是否已存在于DataFrame中
+        if ini_confirm_month in timeline_df['val_month'].values:
+            # 如果存在，直接更新该行的 'actuarial_iacf' 值
+            timeline_df.loc[timeline_df['val_month'] == ini_confirm_month, 'actuarial_iacf'] = actuarial_iacf
         else:
-            timeline_df = actuarial_row
-
+            # 如果不存在，则新增一行
+            new_row = pd.DataFrame({
+                'val_month': [ini_confirm_month],
+                'actuarial_iacf': [actuarial_iacf]
+            })
+            timeline_df = pd.concat([timeline_df, new_row], ignore_index=True)
+    
+    print("--- IACF DEBUG END ---", file=sys.stderr)
 
     # 5. 数据清洗和计算总计
+    # --- FIX: 在计算前，确保所有必需的费用列都存在 ---
+    required_cols = ['iacf_fol_cny', 'iacf_fol_tax', 'iacf_unfol_amt', 'actuarial_iacf']
+    for col in required_cols:
+        if col not in timeline_df.columns:
+            timeline_df[col] = 0.0
+
     timeline_df = timeline_df.fillna(0)
     if not timeline_df.empty:
         timeline_df['total_iacf'] = timeline_df['iacf_fol_cny'] + timeline_df['iacf_unfol_amt'] + timeline_df['actuarial_iacf'] + timeline_df['iacf_fol_tax']

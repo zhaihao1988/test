@@ -1,48 +1,98 @@
 import pandas as pd
 from sqlalchemy.engine import Engine
 from sqlalchemy import text
-from typing import Dict, Any, Tuple
+from typing import Dict, Any, Tuple, List
 
-def get_reinsurance_assumptions(engine: Engine, val_method: str) -> Dict[str, Dict[str, Any]]:
-    """
-    加载所有评估月份的再保精算假设数据。
-    """
+def get_reinsurance_inward_assumptions(engine: Engine) -> Dict[str, Dict[str, Any]]:
+    """加载所有评估月份的再保分入精算假设数据 (val_method = '11')。"""
     query = text("""
         SELECT val_month, class_code, loss_ratio, maintenance_expense_ratio, 
                indirect_claims_expense_ratio, ra AS risk_adjustment_ratio
         FROM measure_platform.conf_measure_actuarial_assumption
-        WHERE val_method = :val_method
+        WHERE val_method = '11'
     """)
     try:
         with engine.connect() as connection:
-            df = pd.read_sql(query, connection, params={'val_method': val_method})
+            df = pd.read_sql(query, connection)
         
         assumptions_map = df.groupby('val_month').apply(
             lambda x: x.set_index('class_code').to_dict('index')
         ).to_dict()
         return assumptions_map
     except Exception as e:
-        print(f"Error fetching reinsurance assumptions: {e}")
+        print(f"Error fetching reinsurance inward assumptions: {e}")
         raise
 
-def get_reinsurance_claim_models(engine: Engine) -> Dict[str, list]:
+def get_reinsurance_outward_assumptions(engine: Engine) -> Dict[str, Dict[str, Any]]:
+    """加载所有评估月份的再保分出精算假设数据 (val_method = '10')。"""
+    query = text("""
+        SELECT val_month, class_code, loss_ratio, maintenance_expense_ratio, 
+               indirect_claims_expense_ratio, ra AS risk_adjustment_ratio
+        FROM measure_platform.conf_measure_actuarial_assumption
+        WHERE val_method = '10'
+    """)
+    try:
+        with engine.connect() as connection:
+            df = pd.read_sql(query, connection)
+        
+        assumptions_map = df.groupby('val_month').apply(
+            lambda x: x.set_index('class_code').to_dict('index')
+        ).to_dict()
+        return assumptions_map
+    except Exception as e:
+        print(f"Error fetching reinsurance outward assumptions: {e}")
+        raise
+
+def get_reinsurance_claim_models(engine: Engine) -> Dict[str, List[float]]:
     """
-    加载所有险类的赔付模式数据。
+    从数据库加载所有险类的赔付模式, 并按 class_code 进行聚合。
+    使用新表 conf_measure_claim_model_new。
     """
     query = text("""
         SELECT class_code, month_id, paid_ratio
         FROM measure_platform.conf_measure_claim_model_new
         ORDER BY class_code, month_id
     """)
-    try:
-        with engine.connect() as connection:
-            df = pd.read_sql(query, connection)
+    
+    with engine.connect() as connection:
+        df = pd.read_sql_query(query, connection)
+        
+    if df.empty:
+        return {}
 
-        claim_model_map = df.groupby('class_code')['paid_ratio'].apply(list).to_dict()
-        return claim_model_map
-    except Exception as e:
-        print(f"Error fetching reinsurance claim models: {e}")
-        raise
+    # 确保 paid_ratio 是浮点数
+    df['paid_ratio'] = pd.to_numeric(df['paid_ratio'], errors='coerce').fillna(0.0)
+
+    # 按 class_code 分组, 并将每个组的 paid_ratio 聚合为一个列表
+    claim_model_map = df.groupby('class_code')['paid_ratio'].apply(list).to_dict()
+    
+    return claim_model_map
+
+
+def get_direct_insurance_loss_map(engine: Engine, policy_no: str, certi_no: str) -> Dict[str, float]:
+    """
+    获取指定直保保单/批单在所有评估月的亏损部分(lrc_loss_amt)。
+    这些数据将作为再保分出计算的基础。
+    """
+    certi_no_filter_sql = f"certi_no = '{certi_no}'" if certi_no and certi_no != 'NA' else "(certi_no IS NULL OR certi_no = 'NA')"
+    sql = f"""
+    SELECT 
+        val_month,
+        lrc_loss_amt
+    FROM measure_platform.measure_cx_unexpired
+    WHERE policy_no = '{policy_no}'
+      AND {certi_no_filter_sql}
+      AND val_method = '8' -- 确保只获取直保的正式计量结果
+    ORDER BY val_month;
+    """
+    df = pd.read_sql(text(sql), engine)
+    if df.empty:
+        return {}
+    
+    # 将 lrc_loss_amt 转换为 float 类型以避免 Decimal 序列化问题
+    df['lrc_loss_amt'] = df['lrc_loss_amt'].astype(float)
+    
+    return df.set_index('val_month')['lrc_loss_amt'].to_dict()
 
 def get_reinsurance_discount_rates(engine: Engine) -> Dict[str, Dict[int, float]]:
     """

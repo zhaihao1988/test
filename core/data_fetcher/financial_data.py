@@ -1,6 +1,9 @@
 import pandas as pd
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
+from datetime import datetime
+from dateutil.relativedelta import relativedelta
+
 
 PREMIUM_HISTORY_TABLE_NAME = "bi_to_cas25.pi_should_rec_pay_off_mon"
 GROUP_IACF_TABLE_NAME = "public.t_aoc_fee_final_measure"
@@ -54,17 +57,25 @@ def get_total_premium_for_group(engine: Engine, group_id: str, val_month: str) -
         result = connection.execute(query, {"group_id": group_id, "val_month": val_month}).scalar_one_or_none()
     return float(result) if result is not None else 0.0
 
-def get_actuarial_assumption(engine: Engine, class_code: str, ini_confirm_month: str) -> float:
-    """获取精算假设费率。"""
+def get_actuarial_assumption(engine: Engine, class_code: str, ini_confirm_month: str, val_method: str) -> float:
+    """获取精算假设费率，根据 class_code, val_month 和 val_method 精确查找。"""
     query = text(f"""
-        SELECT first_day_acquisition_expense_ratio
+        SELECT acquisition_expense_ratio
         FROM {ACTUARIAL_ASSUMPTION_TABLE_NAME}
-        WHERE class_code = :class_code AND TO_CHAR(start_date, 'YYYYMM') <= :ini_confirm_month AND TO_CHAR(end_date, 'YYYYMM') >= :ini_confirm_month
+        WHERE class_code = :class_code AND val_month = :ini_confirm_month AND val_method = :val_method
         LIMIT 1
     """)
     with engine.connect() as connection:
-        result = connection.execute(query, {"class_code": class_code, "ini_confirm_month": ini_confirm_month}).scalar_one_or_none()
-    return float(result) if result is not None else 0.0
+        result = connection.execute(
+            query,
+            {"class_code": class_code, "ini_confirm_month": ini_confirm_month, "val_method": val_method}
+        ).scalar_one_or_none()
+        
+    if result is None:
+        print(f"Warning: Could not find actuarial assumption for class_code={class_code}, month={ini_confirm_month}, method={val_method}")
+        return 0.0
+        
+    return float(result)
 
 def fetch_iacf_fol_rows(engine: Engine, policy_no: str, certi_no: str | None, val_month: str) -> pd.DataFrame:
     

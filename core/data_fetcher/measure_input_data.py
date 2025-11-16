@@ -69,6 +69,7 @@ def get_discount_rates_map(engine: Engine, val_months: list) -> Dict[str, Dict[i
 def get_claim_model_map(engine: Engine) -> Dict[str, list]:
     """
     获取所有赔付模式，并按 class_code 组织。
+    从直保专用的新表中获取。
     """
     sql = """
     SELECT class_code, paid_ratio
@@ -112,6 +113,8 @@ def get_iacf_fol_map(engine: Engine, policy_no: str, certi_no: str) -> Dict[str,
     GROUP BY val_month;
     """
     df = pd.read_sql(text(sql), engine)
+    if df.empty:
+        return {}
     return df.set_index('val_month')['amount'].to_dict()
 
 def get_iacf_unfol_map(engine: Engine, policy_no: str, certi_no: str) -> Dict[str, float]:
@@ -127,4 +130,7 @@ def get_iacf_unfol_map(engine: Engine, policy_no: str, certi_no: str) -> Dict[st
     GROUP BY val_month;
     """
     df = pd.read_sql(text(sql), engine)
+    # 如果查询结果为空，返回一个空字典，调用方会将其作为0处理
+    if df.empty:
+        return {}
     return df.set_index('val_month')['amount'].to_dict()
