@@ -43,7 +43,7 @@ def calculate_unsettled_pv(
     if months_passed > len(claim_pattern):
         remaining_pattern = []
     else:
-        remaining_pattern = claim_pattern[months_passed-1:]
+        remaining_pattern = claim_pattern[months_passed:]
     
     sum_remaining_pattern = sum(remaining_pattern)
     if sum_remaining_pattern == 0:
@@ -61,16 +61,20 @@ def calculate_unsettled_pv(
         
         # b. 计算折现因子
         discount_factor = 1.0
-        
-        # 根据 use_current_rate_curve 决定利率曲线的起始期数
-        # PV1 (当期曲线): 永远从第1期利率开始
-        # PV3 (事故曲线): 从 (已过月数 + 当前期数) 的利率开始
-        start_period = 1 if use_current_rate_curve else months_passed
-        
         rate_log = []
+
+        # PV1: 利率从第1期开始 (相对于评估月)
+        # PV3: 利率从评估月之后的第一期开始 (相对于事故月利率曲线)
+        # e.g. 事故月2411, 评估月2412, 已过2个月(months_passed=2). 
+        # 第一个未来现金流(2501末)折现到2412末, 使用的是第2期的利率(rate_2), 
+        # 因为rate_1用于2411末->2412末的折现.
+        start_rate_term = 1 if use_current_rate_curve else months_passed
+        
+        # 累积折现因子
         for j in range(period):
-            term = start_period + j
+            term = start_rate_term + j
             rate = discount_rates.get(term, 0)
+            if rate is None: rate = 0
             discount_factor *= (1 + rate)
             rate_log.append(f"(1+{rate:.6f})")
 
@@ -83,7 +87,7 @@ def calculate_unsettled_pv(
             "未来月份": (eval_date + relativedelta(months=period)).strftime('%Y%m'),
             "赔付进展因子": ratio,
             "现金流": cash_flow,
-            "利率期限": f"第{start_period}到{start_period+period-1}月",
+            "利率期限": f"第{start_rate_term}到{start_rate_term + period - 1}月",
             "累积折现因子计算": " * ".join(rate_log) + f" = {discount_factor:.6f}",
             "累积折现因子": discount_factor,
             "当期现值": pv_of_period
@@ -172,6 +176,13 @@ def calculate_direct_unsettled_measure(
         if not assumption_row.empty:
             ra_value = assumption_row.iloc[0].get('lic_ra', 0.0)
             
+    # --- 标题翻译映射 ---
+    title_map = {
+        'case_amt': '已报案赔案',
+        'ibnr_amt': 'IBNR',
+        'ulae_amt': '理赔费用'
+    }
+
     # --- 循环计算所有金额类型 ---
     amount_types = ['case_amt', 'ibnr_amt', 'ulae_amt']
     for amount_type in amount_types:
@@ -181,18 +192,29 @@ def calculate_direct_unsettled_measure(
 
         # Correct field name prefix by removing '_amt' for pv fields
         pv_prefix = amount_type.replace('_amt', '')
+        cn_title = title_map.get(amount_type, amount_type)
 
         # -- PV1 (BEL & RA) --
         pv1_bel, pv1_log = calculate_unsettled_pv(amount, claim_pattern_list, current_rates_dict, accident_month, evaluation_month, True)
         final_results[f'pv_{pv_prefix}_current'] = pv1_bel
         final_results[f'pv_{pv_prefix}_current_ra'] = pv1_bel * ra_value
-        logs.append({"title": f"{amount_type} - PV1 (当期利率) 计算过程", "log": pv1_log, "summary": {"总现值(BEL)": pv1_bel}})
+        
+        pv1_summary = {
+            "总现值(BEL)": pv1_bel,
+            "利率曲线": f"使用评估月份 {evaluation_month} 的利率曲线"
+        }
+        logs.append({"title": f"{cn_title} - PV1 (当期利率) 计算过程", "log": pv1_log, "summary": pv1_summary})
         
         # -- PV3 (BEL & RA) --
         pv3_bel, pv3_log = calculate_unsettled_pv(amount, claim_pattern_list, accident_rates_dict, accident_month, evaluation_month, False)
         final_results[f'pv_{pv_prefix}_accident'] = pv3_bel
         final_results[f'pv_{pv_prefix}_accident_ra'] = pv3_bel * ra_value
-        logs.append({"title": f"{amount_type} - PV3 (事故时点利率) 计算过程", "log": pv3_log, "summary": {"总现值(BEL)": pv3_bel}})
+        
+        pv3_summary = {
+            "总现值(BEL)": pv3_bel,
+            "利率曲线": f"使用事故月份 {accident_month} 的利率曲线"
+        }
+        logs.append({"title": f"{cn_title} - PV3 (事故时点利率) 计算过程", "log": pv3_log, "summary": pv3_summary})
 
         # -- 计算下一期末现值 (用于财务费用) --
         try:

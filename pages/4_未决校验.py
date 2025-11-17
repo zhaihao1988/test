@@ -17,8 +17,14 @@ st.set_page_config(
 st.title("未决赔款校验")
 
 # --- 定义常量 ---
-WIDGET_KEYS = ['val_month_select', 'risk_code_select', 'com_code_select', 'accident_month_select']
-FILTER_FIELDS = ['val_month', 'risk_code', 'com_code', 'accident_month']
+WIDGET_KEYS = [
+    'val_month_select', 'risk_code_select', 'com_code_select', 'accident_month_select',
+    'business_nature_select', 'car_kind_code_select', 'use_nature_code_select'
+]
+FILTER_FIELDS = [
+    'val_month', 'risk_code', 'com_code', 'accident_month',
+    'business_nature', 'car_kind_code', 'use_nature_code'
+]
 VAL_METHOD_MAP = {'直保': '8', '再保分入': '11', '再保分出': '10'}
 
 # --- 初始化 Session State ---
@@ -91,7 +97,17 @@ with col2:
     accident_month_opts = options.get('accident_month', [])
     st.selectbox("事故年月 (accident_month)", accident_month_opts, key='accident_month_select', on_change=update_options, index=get_key_index('accident_month_select', accident_month_opts))
 with col3:
-    pass
+    business_nature_opts = options.get('business_nature', [])
+    st.selectbox("业务性质 (business_nature)", business_nature_opts, key='business_nature_select', on_change=update_options, index=get_key_index('business_nature_select', business_nature_opts))
+
+col4, col5, col6 = st.columns(3)
+with col4:
+    car_kind_code_opts = options.get('car_kind_code', [])
+    st.selectbox("车辆种类 (car_kind_code)", car_kind_code_opts, key='car_kind_code_select', on_change=update_options, index=get_key_index('car_kind_code_select', car_kind_code_opts))
+with col5:
+    use_nature_code_opts = options.get('use_nature_code', [])
+    st.selectbox("使用性质 (use_nature_code)", use_nature_code_opts, key='use_nature_code_select', on_change=update_options, index=get_key_index('use_nature_code_select', use_nature_code_opts))
+
 
 if st.button("🔍 查询数据"):
     final_filters = {field: st.session_state[key] for field, key in zip(FILTER_FIELDS, WIDGET_KEYS)}
@@ -155,8 +171,14 @@ if process_trigger and data_for_calculation is not None:
             assumptions_df = get_actuarial_assumptions(db_engine, st.session_state.val_method, eval_month)
             
             # 获取数据库中的比对结果
-            unit_id = record['unit_id']
-            db_results_series = get_db_unsettled_result(db_engine, eval_month, unit_id, st.session_state.val_method)
+            # 新逻辑：使用所有级联菜单字段 + group_id 进行匹配
+            result_filters = {field: record.get(field) for field in FILTER_FIELDS}
+            result_filters['group_id'] = record.get('group_id')
+            
+            # 移除值为 None 的过滤器，以防查询出错
+            result_filters = {k: v for k, v in result_filters.items() if pd.notna(v)}
+
+            db_results_series = get_db_unsettled_result(db_engine, st.session_state.val_method, result_filters)
 
             # 2. 执行计算
             py_results, logs = calculate_direct_unsettled_measure(
@@ -177,11 +199,26 @@ if process_trigger and data_for_calculation is not None:
                 comparison_df = pd.DataFrame({'指标': py_results.keys(), 'Python 计算结果': py_results.values()})
                 comparison_df['数据库现有结果'] = comparison_df['指标'].map(db_results_series).fillna(pd.NA)
                 
-                py_numeric = pd.to_numeric(comparison_df['Python 计算结果'], errors='coerce')
-                db_numeric = pd.to_numeric(comparison_df['数据库现有结果'], errors='coerce')
-                comparison_df['差异'] = (py_numeric - db_numeric)
+                # --- 用户要求只展示6个核心指标并翻译 ---
+                metrics_map = {
+                    'pv_case_current': '已报案赔案现值(当期利率)',
+                    'pv_case_accident': '已报案赔案现值(事故时点利率)',
+                    'pv_ibnr_current': 'IBNR现值(当期利率)',
+                    'pv_ibnr_accident': 'IBNR现值(事故时点利率)',
+                    'pv_ulae_current': '理赔费用现值(当期利率)',
+                    'pv_ulae_accident': '理赔费用现值(事故时点利率)'
+                }
+                metrics_to_show = list(metrics_map.keys())
+                
+                filtered_df = comparison_df[comparison_df['指标'].isin(metrics_to_show)].copy()
+                filtered_df['指标'] = filtered_df['指标'].map(metrics_map)
 
-                st.dataframe(comparison_df.style.format("{:.10f}", 
+
+                py_numeric = pd.to_numeric(filtered_df['Python 计算结果'], errors='coerce')
+                db_numeric = pd.to_numeric(filtered_df['数据库现有结果'], errors='coerce')
+                filtered_df['差异'] = (py_numeric - db_numeric)
+
+                st.dataframe(filtered_df.style.format("{:.10f}", 
                                                               subset=['Python 计算结果', '数据库现有结果', '差异'],
                                                               na_rep='N/A'))
             else:

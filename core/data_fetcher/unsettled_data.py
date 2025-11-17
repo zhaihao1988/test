@@ -9,7 +9,8 @@ def get_unsettled_distinct_options(_engine: Engine, val_method: str, selected_fi
     根据已选择的筛选条件，从 int_t_pp_jl_unsettled_group 表中获取剩余字段的可选项列表。
     """
     all_fields = [
-        "val_month", "risk_code", "com_code", "accident_month"
+        "val_month", "risk_code", "com_code", "accident_month",
+        "business_nature", "car_kind_code", "use_nature_code"
     ]
     options = {}
 
@@ -85,21 +86,24 @@ def get_discount_rates(_engine: Engine) -> pd.DataFrame:
         df = pd.read_sql(query, connection)
     return df
 
-def get_db_unsettled_result(_engine: Engine, val_month: str, unit_id: str, val_method: str) -> pd.Series:
+def get_db_unsettled_result(_engine: Engine, val_method: str, selected_filters: dict) -> pd.Series:
     """
     从最终结果表中获取指定计量单元和评估月份的计量结果,用于比对。
+    现在使用一个包含所有筛选条件的字典进行查询。
     """
-    query = text("""
-    SELECT * 
-    FROM measure_platform.measure_cx_unsettled 
-    WHERE "val_month" = :val_month 
-      AND "unit_id" = :unit_id
-      AND "val_method" = :val_method
-    """)
+    base_query = 'SELECT * FROM measure_platform.measure_cx_unsettled WHERE "val_method" = :val_method'
+    params = {'val_method': val_method}
+    
+    for field, value in selected_filters.items():
+        if value is not None:
+            base_query += f' AND "{field}" = :{field}'
+            params[field] = value
+
     with _engine.connect() as connection:
-        df = pd.read_sql(query, connection, params={"val_month": val_month, "unit_id": unit_id, "val_method": val_method})
+        df = pd.read_sql(text(base_query), connection, params=params)
     
     if df.empty:
         return pd.Series(dtype=object)
         
+    # 假设筛选条件能唯一定位一条记录
     return df.iloc[0]
