@@ -115,23 +115,61 @@ if not st.session_state.rein_bills_df.empty:
                             if not final_result_df.empty:
                                 st.subheader("结果比对")
                                 py_result = final_result_df[final_result_df['val_month'] == measure_val_month].iloc[0]
-                                db_result = get_db_reinsurance_measure_result(
-                                    engine,
-                                    measure_val_month,
-                                    selected_row.contract_id,
-                                    selected_row.confirm_date,
-                                    selected_row.pi_start_date
-                                )
+                                try:
+                                    db_result = get_db_reinsurance_measure_result(
+                                        engine,
+                                        measure_val_month,
+                                        selected_row.contract_id,
+                                        selected_row.confirm_date,
+                                        selected_row.pi_start_date
+                                    )
+                                except Exception as e:
+                                    db_result = {'lrc_no_loss_amt': '数据库中无当期评估结果', 'lrc_loss_amt': '数据库中无当期评估结果'}
+                                
+                                db_lrc_no_loss = db_result.get('lrc_no_loss_amt', '数据库中无当期评估结果')
+                                db_lrc_loss = db_result.get('lrc_loss_amt', '数据库中无当期评估结果')
+                                
+                                py_lrc_no_loss = py_result.get('lrc_no_loss_amt')
+                                py_lrc_loss = py_result.get('lrc_loss_amt')
+                                
+                                # 计算差值
+                                try:
+                                    if isinstance(db_lrc_no_loss, str) and '数据库' in db_lrc_no_loss:
+                                        diff_no_loss = "N/A"
+                                    else:
+                                        diff_no_loss = float(py_lrc_no_loss) - float(db_lrc_no_loss)
+                                except (TypeError, ValueError):
+                                    diff_no_loss = "N/A"
+                                
+                                try:
+                                    if isinstance(db_lrc_loss, str) and '数据库' in db_lrc_loss:
+                                        diff_loss = "N/A"
+                                    else:
+                                        diff_loss = float(py_lrc_loss) - float(db_lrc_loss)
+                                except (TypeError, ValueError):
+                                    diff_loss = "N/A"
+                                
                                 comparison_data = {
                                     '指标': ['非亏损部分 (lrc_no_loss_amt)', '亏损部分 (lrc_loss_amt)'],
-                                    'Python 计算结果': [py_result.get('lrc_no_loss_amt'), py_result.get('lrc_loss_amt')],
-                                    '数据库现有结果': [db_result.get('lrc_no_loss_amt'), db_result.get('lrc_loss_amt')],
+                                    'Python 计算结果': [py_lrc_no_loss, py_lrc_loss],
+                                    '数据库现有结果': [db_lrc_no_loss, db_lrc_loss],
+                                    '差值': [diff_no_loss, diff_loss]
                                 }
                                 comparison_df = pd.DataFrame(comparison_data)
-                                comparison_df['差值'] = pd.to_numeric(comparison_df['Python 计算结果'], errors='coerce') - pd.to_numeric(comparison_df['数据库现有结果'], errors='coerce')
                                 
-                                numeric_cols = comparison_df.select_dtypes(include=np.number).columns
-                                st.dataframe(comparison_df.style.format('{:.4f}', subset=numeric_cols, na_rep='N/A'))
+                                # 格式化显示
+                                formatted_data = {
+                                    '指标': comparison_df['指标'],
+                                    'Python 计算结果': comparison_df['Python 计算结果'].apply(lambda x: f"{float(x):.4f}"),
+                                    '数据库现有结果': comparison_df['数据库现有结果'].apply(
+                                        lambda x: x if isinstance(x, str) and '数据库' in x else f"{float(x):.4f}"
+                                    ),
+                                    '差值': comparison_df['差值'].apply(
+                                        lambda x: x if isinstance(x, str) and x == "N/A" else f"{float(x):.4f}"
+                                    )
+                                }
+                                display_df = pd.DataFrame(formatted_data)
+                                st.dataframe(display_df)
 
                             st.subheader("详细计算过程 (逐月)")
                             for month_log in calculation_logs:

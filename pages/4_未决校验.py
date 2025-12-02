@@ -192,38 +192,66 @@ if process_trigger and data_for_calculation is not None:
 
             # 3. 展示结果
             st.subheader("📊 结果比对")
+            
+            # 如果数据库结果为空，创建包含"数据库中无当期评估结果"的Series
+            if db_results_series.empty:
+                db_results_series = pd.Series(dtype=object)
+            
+            # FIX: Convert database result index (column names) to lowercase for case-insensitive matching
             if not db_results_series.empty:
-                # FIX: Convert database result index (column names) to lowercase for case-insensitive matching
                 db_results_series.index = db_results_series.index.str.lower()
 
-                comparison_df = pd.DataFrame({'指标': py_results.keys(), 'Python 计算结果': py_results.values()})
-                comparison_df['数据库现有结果'] = comparison_df['指标'].map(db_results_series).fillna(pd.NA)
-                
-                # --- 用户要求只展示6个核心指标并翻译 ---
-                metrics_map = {
-                    'pv_case_current': '已报案赔案现值(当期利率)',
-                    'pv_case_accident': '已报案赔案现值(事故时点利率)',
-                    'pv_ibnr_current': 'IBNR现值(当期利率)',
-                    'pv_ibnr_accident': 'IBNR现值(事故时点利率)',
-                    'pv_ulae_current': '理赔费用现值(当期利率)',
-                    'pv_ulae_accident': '理赔费用现值(事故时点利率)'
-                }
-                metrics_to_show = list(metrics_map.keys())
-                
-                filtered_df = comparison_df[comparison_df['指标'].isin(metrics_to_show)].copy()
-                filtered_df['指标'] = filtered_df['指标'].map(metrics_map)
-
-
-                py_numeric = pd.to_numeric(filtered_df['Python 计算结果'], errors='coerce')
-                db_numeric = pd.to_numeric(filtered_df['数据库现有结果'], errors='coerce')
-                filtered_df['差异'] = (py_numeric - db_numeric)
-
-                st.dataframe(filtered_df.style.format("{:.10f}", 
-                                                              subset=['Python 计算结果', '数据库现有结果', '差异'],
-                                                              na_rep='N/A'))
+            comparison_df = pd.DataFrame({'指标': py_results.keys(), 'Python 计算结果': py_results.values()})
+            
+            # 如果数据库结果为空，所有指标都显示"数据库中无当期评估结果"
+            if db_results_series.empty:
+                comparison_df['数据库现有结果'] = '数据库中无当期评估结果'
             else:
-                st.warning(f"在数据库中未找到评估月份 {eval_month} 和计量单元 {unit_id} 的比对结果。")
-                st.dataframe(pd.DataFrame({'指标': py_results.keys(), 'Python 计算结果': py_results.values()}))
+                comparison_df['数据库现有结果'] = comparison_df['指标'].map(db_results_series).fillna('数据库中无当期评估结果')
+            
+            # --- 用户要求只展示6个核心指标并翻译 ---
+            metrics_map = {
+                'pv_case_current': '已报案赔案现值(当期利率)',
+                'pv_case_accident': '已报案赔案现值(事故时点利率)',
+                'pv_ibnr_current': 'IBNR现值(当期利率)',
+                'pv_ibnr_accident': 'IBNR现值(事故时点利率)',
+                'pv_ulae_current': '理赔费用现值(当期利率)',
+                'pv_ulae_accident': '理赔费用现值(事故时点利率)'
+            }
+            metrics_to_show = list(metrics_map.keys())
+            
+            filtered_df = comparison_df[comparison_df['指标'].isin(metrics_to_show)].copy()
+            filtered_df['指标'] = filtered_df['指标'].map(metrics_map)
+
+            # 计算差异
+            def calculate_diff(py_val, db_val):
+                try:
+                    if isinstance(db_val, str) and '数据库' in db_val:
+                        return "N/A"
+                    py_num = float(py_val)
+                    db_num = float(db_val)
+                    return py_num - db_num
+                except (TypeError, ValueError):
+                    return "N/A"
+            
+            filtered_df['差异'] = filtered_df.apply(
+                lambda row: calculate_diff(row['Python 计算结果'], row['数据库现有结果']), 
+                axis=1
+            )
+            
+            # 格式化显示
+            formatted_data = {
+                '指标': filtered_df['指标'],
+                'Python 计算结果': filtered_df['Python 计算结果'].apply(lambda x: f"{float(x):.10f}"),
+                '数据库现有结果': filtered_df['数据库现有结果'].apply(
+                    lambda x: x if isinstance(x, str) and '数据库' in x else f"{float(x):.10f}"
+                ),
+                '差异': filtered_df['差异'].apply(
+                    lambda x: x if isinstance(x, str) and x == "N/A" else f"{float(x):.10f}"
+                )
+            }
+            display_df = pd.DataFrame(formatted_data)
+            st.dataframe(display_df)
 
             st.subheader("📝 详细计算过程")
             for log_item in logs:

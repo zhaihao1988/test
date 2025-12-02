@@ -453,6 +453,15 @@ def _perform_loss_test(contract_data, val_month, rolling_results, assumptions_ma
         f"  最终亏损合同负债 (LRC Loss) = max(0, 亏损测试余额) = {lrc_loss_amt:.10f}"
     ])
 
+    # 辅助函数：安全地将 Decimal 转换为 float，其他类型保持不变
+    def decimal_to_float(value):
+        if isinstance(value, Decimal):
+            return float(value)
+        elif isinstance(value, (pd.DataFrame, dict, list)):
+            return value  # 保持 DataFrame 和其他复杂类型不变
+        else:
+            return value
+    
     final_results = {
         **rolling_results, "lrc_no_loss_amt": closing_balance, "lrc_loss_amt": lrc_loss_amt,
         "lrc_debt": closing_balance + lrc_loss_amt, "unexpired_premium": unexpired_premium,
@@ -462,4 +471,8 @@ def _perform_loss_test(contract_data, val_month, rolling_results, assumptions_ma
         "loss_pv_details_df": loss_pv_details_df,
         "maintenance_pv_details_df": maintenance_pv_details_df,
     }
-    return final_results, loss_test_logs
+    
+    # 将所有 Decimal 类型字段转换为 float，确保 DataFrame 显示正常
+    final_results_converted = {k: decimal_to_float(v) for k, v in final_results.items()}
+    
+    return final_results_converted, loss_test_logs

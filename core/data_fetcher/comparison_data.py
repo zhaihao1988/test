@@ -45,12 +45,12 @@ def get_db_measure_result(engine: Engine, val_month: str, policy_no: str, certi_
             df = pd.read_sql(text(sql), connection, params=params)
 
         if df.empty:
-            return {'lrc_no_loss_amt': '未找到', 'lrc_loss_amt': '未找到', 'lrc_loss_cost_policy': '未找到'}
+            return {'lrc_no_loss_amt': '数据库中无当期评估结果', 'lrc_loss_amt': '数据库中无当期评估结果', 'lrc_loss_cost_policy': '数据库中无当期评估结果'}
             
         return df.iloc[0].to_dict()
     except Exception as e:
         print(f"Error fetching DB measure result: {e}")
-        return {'lrc_no_loss_amt': '查询失败', 'lrc_loss_amt': '查询失败', 'lrc_loss_cost_policy': '查询失败'}
+        return {'lrc_no_loss_amt': '数据库中无当期评估结果', 'lrc_loss_amt': '数据库中无当期评估结果', 'lrc_loss_cost_policy': '数据库中无当期评估结果'}
 
 
 def get_db_reinsurance_measure_result(
@@ -96,12 +96,12 @@ def get_db_reinsurance_measure_result(
             df = pd.read_sql(text(query), connection, params=params)
         
         if df.empty:
-            return {'lrc_no_loss_amt': '未找到', 'lrc_loss_amt': '未找到'}
+            return {'lrc_no_loss_amt': '数据库中无当期评估结果', 'lrc_loss_amt': '数据库中无当期评估结果'}
             
         return df.iloc[0].to_dict()
     except Exception as e:
         print(f"Error fetching DB reinsurance measure result with composite key: {e}")
-        return {'lrc_no_loss_amt': '查询失败', 'lrc_loss_amt': '查询失败'}
+        return {'lrc_no_loss_amt': '数据库中无当期评估结果', 'lrc_loss_amt': '数据库中无当期评估结果'}
 
 def get_db_reinsurance_outward_measure_result(engine: Engine, val_month: str, policy_no: str, certi_no: str, contract_id: str) -> Dict:
     """
@@ -127,8 +127,8 @@ def get_db_reinsurance_outward_measure_result(engine: Engine, val_month: str, po
     
     if df.empty:
         return {
-            "closing_balance": "未找到", "loss_component": "未找到", "lrc_debt": "未找到",
-            "current_investment_amortization": "未找到", "acc_investment_amortization": "未找到"
+            "closing_balance": "数据库中无当期评估结果", "loss_component": "数据库中无当期评估结果", "lrc_debt": "数据库中无当期评估结果",
+            "current_investment_amortization": "数据库中无当期评估结果", "acc_investment_amortization": "数据库中无当期评估结果"
         }
     return df.iloc[0].to_dict()
 

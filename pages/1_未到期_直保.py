@@ -131,22 +131,31 @@ if st.session_state.direct_policy_data is not None:
                                 # --- 新增：与数据库结果进行比较 ---
                                 st.subheader("结果比对")
                                 with st.spinner("正在从数据库获取比对数据..."):
-                                    db_result = get_db_measure_result(engine, measure_val_month, selected_policy_no, selected_certi_no)
+                                    try:
+                                        db_result = get_db_measure_result(engine, measure_val_month, selected_policy_no, selected_certi_no)
+                                    except Exception as e:
+                                        db_result = {'lrc_no_loss_amt': '数据库中无当期评估结果', 'lrc_loss_amt': '数据库中无当期评估结果'}
                                     
                                     py_lrc_no_loss = final_result_df.iloc[0]['lrc_no_loss_amt']
                                     py_lrc_loss = final_result_df.iloc[0]['lrc_loss_amt']
                                     
-                                    db_lrc_no_loss = db_result.get('lrc_no_loss_amt')
-                                    db_lrc_loss = db_result.get('lrc_loss_amt')
+                                    db_lrc_no_loss = db_result.get('lrc_no_loss_amt', '数据库中无当期评估结果')
+                                    db_lrc_loss = db_result.get('lrc_loss_amt', '数据库中无当期评估结果')
                                     
                                     # 计算差异
                                     try:
                                         # 确保双方都是数值类型再计算
-                                        diff_no_loss = float(py_lrc_no_loss) - float(db_lrc_no_loss)
+                                        if isinstance(db_lrc_no_loss, str) and '数据库' in db_lrc_no_loss:
+                                            diff_no_loss = "N/A"
+                                        else:
+                                            diff_no_loss = float(py_lrc_no_loss) - float(db_lrc_no_loss)
                                     except (TypeError, ValueError):
-                                        diff_no_loss = "N/A" # 如果数据库值是'未找到'或无法转换
+                                        diff_no_loss = "N/A" # 如果数据库值无法转换
                                     try:
-                                        diff_loss = float(py_lrc_loss) - float(db_lrc_loss)
+                                        if isinstance(db_lrc_loss, str) and '数据库' in db_lrc_loss:
+                                            diff_loss = "N/A"
+                                        else:
+                                            diff_loss = float(py_lrc_loss) - float(db_lrc_loss)
                                     except (TypeError, ValueError):
                                         diff_loss = "N/A"
 
@@ -157,17 +166,21 @@ if st.session_state.direct_policy_data is not None:
                                         '差值': [diff_no_loss, diff_loss]
                                     }
                                     comparison_df = pd.DataFrame(comparison_data)
-
-                                    # Convert to numeric, coercing errors to NaN
-                                    comparison_df['数据库现有结果'] = pd.to_numeric(comparison_df['数据库现有结果'], errors='coerce')
-                                    comparison_df['差值'] = pd.to_numeric(comparison_df['差值'], errors='coerce')
                                     
-                                    format_dict = {
-                                        'Python 计算结果': '{:.10f}',
-                                        '数据库现有结果': '{:.10f}',
-                                        '差值': '{:.10f}'
+                                    # 格式化显示：Python结果始终格式化，数据库结果如果是字符串则保持原样
+                                    formatted_data = {
+                                        '指标': comparison_df['指标'],
+                                        'Python 计算结果': comparison_df['Python 计算结果'].apply(lambda x: f"{float(x):.10f}"),
+                                        '数据库现有结果': comparison_df['数据库现有结果'].apply(
+                                            lambda x: x if isinstance(x, str) and ('数据库' in x or 'N/A' in x) else f"{float(x):.10f}"
+                                        ),
+                                        '差值': comparison_df['差值'].apply(
+                                            lambda x: x if isinstance(x, str) and x == "N/A" else f"{float(x):.10f}"
+                                        )
                                     }
-                                    st.dataframe(comparison_df.style.format(format_dict, na_rep='N/A'))
+                                    display_df = pd.DataFrame(formatted_data)
+                                    
+                                    st.dataframe(display_df)
 
 
                                 st.subheader("详细计算过程")

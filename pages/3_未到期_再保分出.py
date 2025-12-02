@@ -134,44 +134,62 @@ if not st.session_state.reout_contracts_df.empty:
                                 # --- NEW LAYOUT: Show comparison right after main results ---
                                 if not final_result_df.empty:
                                     st.subheader("结果比对")
-                                    db_result = get_db_reinsurance_outward_measure_result(engine, measure_val_month, selected_policy_no, selected_certi_no, selected_contract_id)
+                                    try:
+                                        db_result = get_db_reinsurance_outward_measure_result(engine, measure_val_month, selected_policy_no, selected_certi_no, selected_contract_id)
+                                    except Exception as e:
+                                        db_result = {
+                                            "closing_balance": "数据库中无当期评估结果", 
+                                            "loss_component": "数据库中无当期评估结果", 
+                                            "lrc_debt": "数据库中无当期评估结果",
+                                            "current_investment_amortization": "数据库中无当期评估结果", 
+                                            "acc_investment_amortization": "数据库中无当期评估结果"
+                                        }
+                                    
                                     py_result = final_result_df.iloc[-1]
                                     
+                                    metrics = [
+                                        ('非亏损部分 (closing_balance)', 'closing_balance'),
+                                        ('亏损部分 (loss_component)', 'loss_component'),
+                                        ('未到期责任资产 (lrc_debt)', 'lrc_debt'),
+                                        ('当期投资成分摊销', 'current_investment_amortization'),
+                                        ('累计投资成分摊销', 'acc_investment_amortization')
+                                    ]
+                                    
                                     comparison_data = {
-                                        '指标': [
-                                            '非亏损部分 (closing_balance)', 
-                                            '亏损部分 (loss_component)', 
-                                            '未到期责任资产 (lrc_debt)',
-                                            '当期投资成分摊销',
-                                            '累计投资成分摊销'
-                                        ],
-                                        'Python 计算结果': [
-                                            py_result.get('closing_balance'), 
-                                            py_result.get('loss_component'), 
-                                            py_result.get('lrc_debt'),
-                                            py_result.get('current_investment_amortization'),
-                                            py_result.get('acc_investment_amortization')
-                                        ],
-                                        '数据库现有结果': [
-                                            db_result.get('closing_balance'), 
-                                            db_result.get('loss_component'), 
-                                            db_result.get('lrc_debt'),
-                                            db_result.get('current_investment_amortization'),
-                                            db_result.get('acc_investment_amortization')
-                                        ],
+                                        '指标': [m[0] for m in metrics],
+                                        'Python 计算结果': [py_result.get(m[1], 0) for m in metrics],
+                                        '数据库现有结果': [db_result.get(m[1], '数据库中无当期评估结果') for m in metrics],
                                     }
+                                    
+                                    # 计算差值
+                                    differences = []
+                                    for m in metrics:
+                                        py_val = py_result.get(m[1], 0)
+                                        db_val = db_result.get(m[1], '数据库中无当期评估结果')
+                                        try:
+                                            if isinstance(db_val, str) and '数据库' in db_val:
+                                                differences.append("N/A")
+                                            else:
+                                                differences.append(float(py_val) - float(db_val))
+                                        except (TypeError, ValueError):
+                                            differences.append("N/A")
+                                    
+                                    comparison_data['差值'] = differences
                                     comparison_df = pd.DataFrame(comparison_data)
                                     
-                                    comparison_df['Python 计算结果'] = pd.to_numeric(comparison_df['Python 计算结果'], errors='coerce')
-                                    comparison_df['数据库现有结果'] = pd.to_numeric(comparison_df['数据库现有结果'], errors='coerce')
-                                    
-                                    comparison_df['差值'] = comparison_df['Python 计算结果'] - comparison_df['数据库现有结果']
-
-                                    st.dataframe(comparison_df.style.format(
-                                        '{:.4f}',
-                                        na_rep='N/A',
-                                        subset=['Python 计算结果', '数据库现有结果', '差值']
-                                    ))
+                                    # 格式化显示
+                                    formatted_data = {
+                                        '指标': comparison_df['指标'],
+                                        'Python 计算结果': comparison_df['Python 计算结果'].apply(lambda x: f"{float(x):.4f}"),
+                                        '数据库现有结果': comparison_df['数据库现有结果'].apply(
+                                            lambda x: x if isinstance(x, str) and '数据库' in x else f"{float(x):.4f}"
+                                        ),
+                                        '差值': comparison_df['差值'].apply(
+                                            lambda x: x if isinstance(x, str) and x == "N/A" else f"{float(x):.4f}"
+                                        )
+                                    }
+                                    display_df = pd.DataFrame(formatted_data)
+                                    st.dataframe(display_df)
 
                                 st.subheader("详细计算过程 (逐月)")
                                 for month_log in calculation_logs:
