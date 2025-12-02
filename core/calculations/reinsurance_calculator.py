@@ -214,12 +214,29 @@ def calculate_reinsurance_unexpired_measure(
     # --- 2. Generate Timeline ---
     main_logs.write("步骤 2: 生成计算时间轴...\n")
     try:
+        # 获取初始确认日
         first_ini_confirm_date = all_measure_records_df['ini_confirm'].iloc[0]
         if pd.isna(first_ini_confirm_date):
             raise ValueError("'ini_confirm' date is missing from the measurement records.")
-        ini_confirm_month = first_ini_confirm_date.strftime('%Y%m')
+        
+        # 获取确认日期并转换为日期对象
+        confirm_date_parsed = pd.to_datetime(confirm_date)
+        ini_confirm_date_parsed = pd.to_datetime(first_ini_confirm_date)
+        
+        # 初始计量日期取 confirm_date 与 ini_confirm 的孰晚值
+        effective_start_date = max(confirm_date_parsed, ini_confirm_date_parsed)
+        initial_measure_month = effective_start_date.strftime('%Y%m')
+        
+        # 利率曲线仍使用原始 ini_confirm 的月份
+        ini_confirm_month = ini_confirm_date_parsed.strftime('%Y%m')
+        
+        main_logs.write(f"  - 确认日期 (confirm_date): {confirm_date_parsed.strftime('%Y-%m-%d')}\n")
+        main_logs.write(f"  - 初始确认日 (ini_confirm): {ini_confirm_date_parsed.strftime('%Y-%m-%d')}\n")
+        main_logs.write(f"  - 初始计量日期 (取孰晚): {effective_start_date.strftime('%Y-%m-%d')}\n")
+        main_logs.write(f"  - 初始计量月: {initial_measure_month}\n")
+        main_logs.write(f"  - 利率曲线锁定月 (使用原始ini_confirm): {ini_confirm_month}\n")
 
-        start_month_dt = first_ini_confirm_date.to_pydatetime().date().replace(day=1)
+        start_month_dt = effective_start_date.to_pydatetime().date().replace(day=1)
         end_month_dt = datetime.strptime(measure_val_month, '%Y%m').date().replace(day=1)
         
         months_to_calculate = []
@@ -239,7 +256,7 @@ def calculate_reinsurance_unexpired_measure(
     cost_timeline_df = build_reinsurance_cost_timeline(
         measure_prep_record,    # For premium, commission, brokerage
         all_measure_records_df, # For iacf_unfol flows
-        ini_confirm_month
+        initial_measure_month  # 使用初始计量月（孰晚值）来记录现金流
     )
     cash_flows_map = cost_timeline_df.set_index('month').to_dict(orient='index')
 
@@ -281,22 +298,45 @@ def calculate_reinsurance_unexpired_measure(
         month_counter += 1
         current_month_cash_flows = cash_flows_map.get(val_month, {})
         
-        # --- CORRECT LOGIC: Calculate CUMULATIVE amortization base dynamically ---
+        # --- NEW LOGIC: Calculate CUMULATIVE amortization base dynamically with incremental logic ---
         # Base is the '202412' value.
         base_record = all_measure_records_df[all_measure_records_df['val_month'] == '202412']
         amort_base = D(base_record['no_iacf_cash_flow'].iloc[0]) if not base_record.empty else D(0)
         
-        # Add cumulative values from 2025 onwards up to the current month.
-        future_records_for_amort = all_measure_records_df[
+        # Initialize cumulative amortization base with 202412 base
+        cumulative_iacf_unfol_for_amort = amort_base
+        
+        # Process months from 202501 up to current month with new incremental logic
+        future_months = sorted(all_measure_records_df[
             (all_measure_records_df['val_month'] > '202412') &
             (all_measure_records_df['val_month'] <= val_month)
-        ]
-        cumulative_iacf_unfol_for_amort = amort_base + D(future_records_for_amort['no_iacf_cash_flow'].sum())
+        ]['val_month'].unique().tolist())
+        
+        for month in future_months:
+            month_record = all_measure_records_df[all_measure_records_df['val_month'] == month]
+            current_accumulated = D(month_record['no_iacf_cash_flow'].iloc[0]) if not month_record.empty else D(0)
+            
+            if current_accumulated == 0:
+                continue
+            
+            if month == '202501':
+                # 202501: Use cumulative value directly as new amount
+                cumulative_iacf_unfol_for_amort += current_accumulated
+            elif month >= '202502':
+                # 202502+: Use difference (current month - previous month)
+                prev_month = (pd.to_datetime(month, format='%Y%m') - pd.DateOffset(months=1)).strftime('%Y%m')
+                prev_record = all_measure_records_df[all_measure_records_df['val_month'] == prev_month]
+                prev_accumulated = D(prev_record['no_iacf_cash_flow'].iloc[0]) if not prev_record.empty else D(0)
+                
+                new_amount = current_accumulated - prev_accumulated
+                if new_amount > 0:
+                    cumulative_iacf_unfol_for_amort += new_amount
+                # If new_amount <= 0, do not add anything (or could log a warning)
 
         # Use a copy of static_data to pass the dynamic amortization base
         static_data_for_month = static_data.copy()
         static_data_for_month['iacf_unfol'] = cumulative_iacf_unfol_for_amort
-        # --- END CORRECT LOGIC ---
+        # --- END NEW LOGIC ---
 
         class_code = static_data.get('class_code', 'default')
         
@@ -427,21 +467,43 @@ def build_reinsurance_cost_timeline(
     timeline[initial_confirm_month]['commission'] += commission
     timeline[initial_confirm_month]['brokerage'] += brokerage
 
-    # 2. Book 'no_iacf_cash_flow' based on the cutoff rule
+    # 2. Book 'no_iacf_cash_flow' based on the cutoff rule and new logic for 202501+
+    # First, collect all non-follow-up costs by month (cumulative values)
+    unfol_by_month = {}
     for index, row in all_records_df.iterrows():
         current_month = row['val_month']
         no_iacf_flow = D(row.get('no_iacf_cash_flow', 0) or 0)
-
-        if no_iacf_flow == 0:
-            continue
-
-        if current_month == cutoff_month:
-            # Book the 202412 value to the initial month
-            timeline[initial_confirm_month]['iacf_unfol'] += no_iacf_flow
-        elif current_month > cutoff_month:
-            # Book future flows to their own month
+        
+        if no_iacf_flow != 0:
+            unfol_by_month[current_month] = no_iacf_flow
+    
+    # Process 202412: Book to initial month (unchanged)
+    if cutoff_month in unfol_by_month:
+        timeline[initial_confirm_month]['iacf_unfol'] += unfol_by_month[cutoff_month]
+    
+    # Process 202501 and later: Apply new logic
+    sorted_months = sorted([m for m in unfol_by_month.keys() if m > cutoff_month])
+    
+    for current_month in sorted_months:
+        current_accumulated = unfol_by_month[current_month]
+        
+        if current_month == '202501':
+            # 202501: Use cumulative value directly as new amount
             get_or_create_month_entry(current_month)
-            timeline[current_month]['iacf_unfol'] += no_iacf_flow
+            timeline[current_month]['iacf_unfol'] += current_accumulated
+        elif current_month >= '202502':
+            # 202502+: Use difference (current month - previous month)
+            prev_month = (pd.to_datetime(current_month, format='%Y%m') - pd.DateOffset(months=1)).strftime('%Y%m')
+            prev_accumulated = unfol_by_month.get(prev_month, D(0))  # Use 0 if previous month has no data
+            new_amount = current_accumulated - prev_accumulated
+            
+            if new_amount > 0:
+                get_or_create_month_entry(current_month)
+                timeline[current_month]['iacf_unfol'] += new_amount
+            elif new_amount < 0:
+                # Log warning if cumulative value decreases
+                get_or_create_month_entry(current_month)
+                timeline[current_month]['iacf_unfol'] += D(0)  # Use 0 for negative values
         # Flows before 202412 are ignored for cash flow purposes, but included in amortization base logic.
 
     if not timeline:

@@ -285,15 +285,56 @@ def calculate_reinsurance_outward_unexpired_measure(
 
         # --- NEW LOGIC: Determine the effective start month ---
         ini_confirm = static_data.get('ini_confirm')
-        pi_start_date = static_data.get('pi_start_date')
-        if pd.isna(ini_confirm) or pd.isna(pi_start_date):
-            raise ValueError("'ini_confirm' or 'pi_start_date' is missing and cannot determine start month.")
-
-        # The effective start date is the later of ini_confirm and pi_start_date
-        effective_start_date = max(pd.to_datetime(ini_confirm), pd.to_datetime(pi_start_date))
+        if pd.isna(ini_confirm):
+            raise ValueError("'ini_confirm' is missing and cannot determine start month.")
+        
+        # 获取签单日期：原保单用 under_write_date，批单用 certi_write_date
+        # 优先从 static_data 获取，如果没有则从历史记录中获取
+        under_write_date = static_data.get('under_write_date')
+        certi_write_date = static_data.get('certi_write_date')
+        
+        # 如果 static_data 中没有，尝试从历史记录中获取
+        if (pd.isna(under_write_date) or under_write_date is None or under_write_date == '') and not all_measure_records_df.empty:
+            if 'under_write_date' in all_measure_records_df.columns:
+                under_write_date = all_measure_records_df['under_write_date'].iloc[0]
+        if (pd.isna(certi_write_date) or certi_write_date is None or certi_write_date == '') and not all_measure_records_df.empty:
+            if 'certi_write_date' in all_measure_records_df.columns:
+                certi_write_date = all_measure_records_df['certi_write_date'].iloc[0]
+        
+        # 根据 certi_no 判断使用哪个签单日期
+        # certi_no 为空或 NULL 表示原保单，使用 under_write_date；否则使用 certi_write_date
+        is_certi_no_empty = (certi_no is None or 
+                            certi_no == '' or 
+                            str(certi_no).strip().upper() in ['NA', 'N/A', 'NULL', 'NONE'])
+        
+        if is_certi_no_empty:
+            # 原保单：使用签单日期 (under_write_date)
+            sign_date = under_write_date
+            sign_date_type = "签单日期 (under_write_date)"
+        else:
+            # 批单：使用批单签单日期 (certi_write_date)
+            sign_date = certi_write_date
+            sign_date_type = "批单签单日期 (certi_write_date)"
+        
+        if pd.isna(sign_date) or sign_date is None or sign_date == '':
+            raise ValueError(f"无法获取签单日期：{sign_date_type} 为空。")
+        
+        # 处理日期格式：如果是字符串格式 'YYYYMMDD'，需要转换为日期对象
+        # 初始计量日期取签单日期与 ini_confirm 的孰晚值
+        if isinstance(sign_date, str) and len(sign_date) == 8 and sign_date.isdigit():
+            # 格式为 'YYYYMMDD'，需要转换
+            sign_date_parsed = pd.to_datetime(sign_date, format='%Y%m%d')
+        else:
+            sign_date_parsed = pd.to_datetime(sign_date)
+        ini_confirm_parsed = pd.to_datetime(ini_confirm)
+        effective_start_date = max(sign_date_parsed, ini_confirm_parsed)
         initial_booking_month = effective_start_date.strftime('%Y%m')
-        main_logs.write(f"  - 初始确认日: {pd.to_datetime(ini_confirm).strftime('%Y-%m-%d')}, 责任起期: {pd.to_datetime(pi_start_date).strftime('%Y-%m-%d')}\n")
-        main_logs.write(f"  - 初始计量月 (取孰晚): {initial_booking_month}\n")
+        
+        main_logs.write(f"  - 批单号 (certi_no): {certi_no if not is_certi_no_empty else '(空-原保单)'}\n")
+        main_logs.write(f"  - {sign_date_type}: {sign_date_parsed.strftime('%Y-%m-%d')}\n")
+        main_logs.write(f"  - 初始确认日 (ini_confirm): {ini_confirm_parsed.strftime('%Y-%m-%d')}\n")
+        main_logs.write(f"  - 初始计量日期 (取孰晚): {effective_start_date.strftime('%Y-%m-%d')}\n")
+        main_logs.write(f"  - 初始计量月: {initial_booking_month}\n")
 
         # The calculation timeline starts from the initial booking month.
         start_month_dt = effective_start_date.to_pydatetime().date().replace(day=1)
@@ -312,11 +353,12 @@ def calculate_reinsurance_outward_unexpired_measure(
         main_logs.write(f"  - 计算期间: 从 {months_to_calculate[0]} 到 {months_to_calculate[-1]}\n")
 
         # --- NEW LOGIC: Lock in rate curve based on original ini_confirm month for IFIE ---
-        original_ini_confirm_month = pd.to_datetime(static_data.get('ini_confirm')).strftime('%Y%m')
+        # 利率曲线仍使用原始 ini_confirm 的月份，而不是孰晚后的日期
+        original_ini_confirm_month = ini_confirm_parsed.strftime('%Y%m')
         locked_in_rate_curve = discount_rates_map.get(original_ini_confirm_month)
         if not locked_in_rate_curve:
             raise ValueError(f"在利率表中未找到用于锁定IFIE计算的初始确认月 '{original_ini_confirm_month}' 的利率曲线。")
-        main_logs.write(f"  - 利率曲线 (用于IFIE) 锁定于初始确认月: {original_ini_confirm_month}\n")
+        main_logs.write(f"  - 利率曲线 (用于IFIE) 锁定于初始确认月 (使用原始ini_confirm): {original_ini_confirm_month}\n")
 
         # --- Get all discount rates once ---
         try:
