@@ -102,12 +102,21 @@ def get_paid_premiums_map(engine: Engine, policy_no: str, certi_no: str) -> Dict
 
 def get_iacf_fol_map(engine: Engine, policy_no: str, certi_no: str) -> Dict[str, float]:
     """
-    获取指定保单所有月份的实际跟单费用 (含税)。
+    获取指定保单所有月份的实际跟单获取费用（当期发生额）。
+
+    数据来源：measure_platform.measure_cf_basic_data_new
+    字段口径：iacf_fol_cny，本币，当期发生额（不再视为累计值）。
     """
-    certi_no_filter_sql = f"certi_no = '{certi_no}'" if certi_no and certi_no != 'NA' else "(certi_no IS NULL OR certi_no = 'NA')"
+    certi_no_filter_sql = (
+        f"certi_no = '{certi_no}'"
+        if certi_no and certi_no not in ['NA', 'N/A', 'NULL', '']
+        else "(certi_no IS NULL OR certi_no IN ('NA', 'N/A', ''))"
+    )
     sql = f"""
-    SELECT val_month, SUM(COALESCE(iacf_fol_cny, 0) + COALESCE(iacf_fol_tax, 0)) as amount
-    FROM public.int_t_pp_jl_iacf_fol_new
+    SELECT
+        val_month,
+        SUM(COALESCE(iacf_fol_cny, 0)) AS amount
+    FROM measure_platform.measure_cf_basic_data_new
     WHERE policy_no = '{policy_no}'
       AND {certi_no_filter_sql}
     GROUP BY val_month;
@@ -119,12 +128,21 @@ def get_iacf_fol_map(engine: Engine, policy_no: str, certi_no: str) -> Dict[str,
 
 def get_iacf_unfol_map(engine: Engine, policy_no: str, certi_no: str) -> Dict[str, float]:
     """
-    获取指定保单所有月份的实际非跟单费用。
+    获取指定保单所有月份的实际非跟单获取费用（当期发生额）。
+
+    数据来源：measure_platform.measure_cf_basic_data_new
+    字段口径：iacf_unfol_cny，本币，当期发生额（不再视为累计值）。
     """
-    certi_no_filter_sql = f"certi_no = '{certi_no}'" if certi_no and certi_no != 'NA' else "(certi_no IS NULL OR certi_no = 'NA')"
+    certi_no_filter_sql = (
+        f"certi_no = '{certi_no}'"
+        if certi_no and certi_no not in ['NA', 'N/A', 'NULL', '']
+        else "(certi_no IS NULL OR certi_no IN ('NA', 'N/A', ''))"
+    )
     sql = f"""
-    SELECT val_month, SUM(iacf_amount) as amount
-    FROM public.int_t_pp_jl_iacf_unfol_new
+    SELECT
+        val_month,
+        SUM(COALESCE(iacf_unfol_cny, 0)) AS amount
+    FROM measure_platform.measure_cf_basic_data_new
     WHERE policy_no = '{policy_no}'
       AND {certi_no_filter_sql}
     GROUP BY val_month;

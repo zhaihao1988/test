@@ -126,7 +126,8 @@ def _perform_monthly_rolling(contract_data, val_month, assumptions_map, discount
          raise ValueError(f"未在 assumptions_map 中找到 {ini_confirm_month_str}/{class_code} 的精算假设")
 
     # --- 2. 准备费用数据 ---
-    total_iacf_amt = Decimal(0) # 用于摊销的总费用基础
+    # total_iacf_amt：用于摊销的“预期总获取费用”基数
+    total_iacf_amt = Decimal(0)
     is_old_policy = ini_confirm_date < datetime.date(2024, 1, 1)
     actuarial_iacf = Decimal(0)
     
@@ -141,27 +142,21 @@ def _perform_monthly_rolling(contract_data, val_month, assumptions_map, discount
         except KeyError:
             raise ValueError(f"未在 assumptions_map 中找到老单 {ini_confirm_month_str}/{class_code} 的精算假设")
 
-    # 按 202412 切分实际费用
-    historical_iacf = Decimal(0)
-    future_iacf_fol_by_month = {}  # 跟单费用按月份
-    future_iacf_unfol_by_month = {}  # 非跟单费用按月份（累计值）
-    
-    # 分离处理跟单费用和非跟单费用
-    # 跟单费用：按月份直接存储
+    # 按 202412 切分实际费用（新口径：fol/unfol 均为当期发生额）
+    historical_iacf_fol = Decimal(0)
+    historical_iacf_unfol = Decimal(0)
+
     for month, amt in iacf_fol_map.items():
         amt_decimal = Decimal(str(amt or 0))
         if month <= '202412':
-            historical_iacf += amt_decimal
-        else:
-            future_iacf_fol_by_month[month] = amt_decimal
-    
-    # 非跟单费用：按月份存储累计值
+            historical_iacf_fol += amt_decimal
+
     for month, amt in iacf_unfol_map.items():
         amt_decimal = Decimal(str(amt or 0))
         if month <= '202412':
-            historical_iacf += amt_decimal
-        else:
-            future_iacf_unfol_by_month[month] = amt_decimal
+            historical_iacf_unfol += amt_decimal
+
+    historical_iacf = historical_iacf_fol + historical_iacf_unfol
 
     # 将历史费用（<=202412）累加到摊销总额中
     total_iacf_amt += historical_iacf
@@ -170,6 +165,7 @@ def _perform_monthly_rolling(contract_data, val_month, assumptions_map, discount
     cumulative_received_premiums = Decimal(0)
     cumulative_premiums = Decimal(0)
     cumulative_iacf = Decimal(0)
+    cumulative_iacf_cashflow = Decimal(0)
     cumulative_ifie = Decimal(0)
     opening_balance = Decimal(0)
     served_days = 0
@@ -197,58 +193,41 @@ def _perform_monthly_rolling(contract_data, val_month, assumptions_map, discount
         dis_rate = Decimal(str(init_month_rate_map.get(month_counter, 0) or 0))
         month_log["logs"].append(f"获取初始确认月({ini_confirm_month_str})的第 {month_counter} 个月远期利率: {dis_rate:.10f}")
         
-        # --- 最终的、按月分配的现金流逻辑 (根据 202412 切分) ---
+        # --- 最终的、按月分配的现金流逻辑 (根据 202412 切分，新口径：fol/unfol 为当期新增) ---
         iacf_cashflow_current = Decimal(0)
+
+        # 当期当期新增获取费用（直保：跟单 + 非跟单），用于现金流与未来摊销基数更新
+        fol_new = Decimal(str(iacf_fol_map.get(month, 0) or 0))
+        unfol_new = Decimal(str(iacf_unfol_map.get(month, 0) or 0))
         
         # 规则1: 如果是首月，则计入所有历史费用 (<=202412) 和老单精算费用
         if month_counter == 1:
             iacf_cashflow_current += historical_iacf
             month_log["logs"].append(f"规则1(首月): 计入202412及之前的实际费用现金流: {historical_iacf:.2f}")
-
+        
             # 如果是老单，再额外计入精算假设费用
             if is_old_policy:
                 iacf_cashflow_current += actuarial_iacf
                 month_log["logs"].append(f"规则1.1(老单首月): 额外计入精算假设费用现金流: {actuarial_iacf:.2f}")
-
-        # 规则2: 如果当前月份晚于202412，则计入当月的实际费用
+        
+        # 规则2: 如果当前月份晚于202412，则计入当月的实际获取费用（fol/unfol 均为当期发生额）
         if month > '202412':
-            # 2.1 处理跟单费用（直接使用当月值）
-            current_month_fol_iacf = future_iacf_fol_by_month.get(month, Decimal(0))
-            iacf_cashflow_current += current_month_fol_iacf
-            if current_month_fol_iacf > 0:
-                month_log["logs"].append(f"规则2.1(>=202501): 计入当期({month})的跟单费用现金流: {current_month_fol_iacf:.2f}")
-            
-            # 2.2 处理非跟单费用（需要特殊处理：202501直接使用累计值，202502+使用差值）
-            current_month_unfol_accumulated = future_iacf_unfol_by_month.get(month, Decimal(0))
-            current_month_unfol_new = Decimal(0)
-            
-            if month == '202501':
-                # 202501月份：直接使用累计值作为新增
-                current_month_unfol_new = current_month_unfol_accumulated
-                if current_month_unfol_new > 0:
-                    month_log["logs"].append(f"规则2.2(202501): 计入当期({month})的非跟单费用累计值作为新增: {current_month_unfol_new:.2f}")
-                    # 更新摊销基数：202412的total_iacf + 202501新增值
-                    total_iacf_amt += current_month_unfol_new
-                    month_log["logs"].append(f"规则2.2.1(202501): 摊销基数更新，新增非跟单费用 {current_month_unfol_new:.2f}，当前摊销基数: {total_iacf_amt:.2f}")
-                    
-            elif month >= '202502':
-                # 202502及以后：使用差值（当月累计 - 上月累计）
-                prev_month = (pd.to_datetime(month, format='%Y%m') - pd.DateOffset(months=1)).strftime('%Y%m')
-                prev_month_unfol_accumulated = future_iacf_unfol_by_month.get(prev_month, Decimal(0))
-                current_month_unfol_new = current_month_unfol_accumulated - prev_month_unfol_accumulated
-                
-                if current_month_unfol_new > 0:
-                    month_log["logs"].append(f"规则2.2(>=202502): 计算当期({month})的非跟单费用新增 = {current_month_unfol_accumulated:.2f} - {prev_month_unfol_accumulated:.2f} = {current_month_unfol_new:.2f}")
-                    # 更新摊销基数：上期摊销基数 + 当月新增值
-                    total_iacf_amt += current_month_unfol_new
-                    month_log["logs"].append(f"规则2.2.1(>=202502): 摊销基数更新，新增非跟单费用 {current_month_unfol_new:.2f}，当前摊销基数: {total_iacf_amt:.2f}")
-                elif current_month_unfol_new < 0:
-                    month_log["logs"].append(f"规则2.2(>=202502): 警告 - 当期({month})的非跟单费用累计值小于上月，差值: {current_month_unfol_new:.2f}，按0处理")
-                    current_month_unfol_new = Decimal(0)
-            
-            iacf_cashflow_current += current_month_unfol_new
+            current_month_iacf_new = fol_new + unfol_new
+            if current_month_iacf_new != 0:
+                month_log["logs"].append(
+                    f"规则2(>=202501): 计入当期({month})的获取费用现金流 = 跟单 {fol_new:.2f} + 非跟单 {unfol_new:.2f} = {current_month_iacf_new:.2f}"
+                )
+            iacf_cashflow_current += current_month_iacf_new
+
+            # 同步更新摊销基数：预期总获取费用增加本期新增的跟单/非跟单
+            if current_month_iacf_new != 0:
+                total_iacf_amt += current_month_iacf_new
+                month_log["logs"].append(
+                    f"规则2.1(>=202501): 摊销基数更新，新增获取费用 {current_month_iacf_new:.2f}，当前预期总获取费用基数 total_iacf_amt: {total_iacf_amt:.2f}"
+                )
 
         month_log["logs"].append(f" -> 当期最终获取费用现金流: {iacf_cashflow_current:.2f}")
+        cumulative_iacf_cashflow += iacf_cashflow_current
 
         premium_cashflow = Decimal(str(paid_premiums_map.get(month, 0) or 0))
         if month_counter == 1:
@@ -297,10 +276,17 @@ def _perform_monthly_rolling(contract_data, val_month, assumptions_map, discount
         monthly_logs.append(month_log)
 
     rolling_results = {
-        "cumulative_premiums": cumulative_premiums, "cumulative_iacf": cumulative_iacf,
-        "cumulative_ifie": cumulative_ifie, "cumulative_received_premiums": cumulative_received_premiums,
-        "closing_balance": opening_balance, "total_iacf_amt": total_iacf_amt,
-        "served_days": served_days, "term_days": term_days, "month_counter": month_counter,
+        "cumulative_premiums": cumulative_premiums,
+        "cumulative_iacf": cumulative_iacf,
+        "cumulative_ifie": cumulative_ifie,
+        "cumulative_received_premiums": cumulative_received_premiums,
+        "cumulative_iacf_cashflow": cumulative_iacf_cashflow,
+        "closing_balance": opening_balance,
+        "total_iacf_amt": total_iacf_amt,
+        "served_days": served_days,
+        "term_days": term_days,
+        "month_counter": month_counter,
+        # 为便于分析，当期获取费用现金流可从日志中最后一期的 iacf_cashflow_current 推导
     }
     return rolling_results, monthly_logs
 
