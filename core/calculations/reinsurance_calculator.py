@@ -323,15 +323,8 @@ def calculate_reinsurance_unexpired_measure(
                 # 202501: Use cumulative value directly as new amount
                 cumulative_iacf_unfol_for_amort += current_accumulated
             elif month >= '202502':
-                # 202502+: Use difference (current month - previous month)
-                prev_month = (pd.to_datetime(month, format='%Y%m') - pd.DateOffset(months=1)).strftime('%Y%m')
-                prev_record = all_measure_records_df[all_measure_records_df['val_month'] == prev_month]
-                prev_accumulated = D(prev_record['no_iacf_cash_flow'].iloc[0]) if not prev_record.empty else D(0)
-                
-                new_amount = current_accumulated - prev_accumulated
-                if new_amount > 0:
-                    cumulative_iacf_unfol_for_amort += new_amount
-                # If new_amount <= 0, do not add anything (or could log a warning)
+                # 202502+: Use cumulative value directly as new amount (same as 202501)
+                cumulative_iacf_unfol_for_amort += current_accumulated
 
         # Use a copy of static_data to pass the dynamic amortization base
         static_data_for_month = static_data.copy()
@@ -492,18 +485,9 @@ def build_reinsurance_cost_timeline(
             get_or_create_month_entry(current_month)
             timeline[current_month]['iacf_unfol'] += current_accumulated
         elif current_month >= '202502':
-            # 202502+: Use difference (current month - previous month)
-            prev_month = (pd.to_datetime(current_month, format='%Y%m') - pd.DateOffset(months=1)).strftime('%Y%m')
-            prev_accumulated = unfol_by_month.get(prev_month, D(0))  # Use 0 if previous month has no data
-            new_amount = current_accumulated - prev_accumulated
-            
-            if new_amount > 0:
-                get_or_create_month_entry(current_month)
-                timeline[current_month]['iacf_unfol'] += new_amount
-            elif new_amount < 0:
-                # Log warning if cumulative value decreases
-                get_or_create_month_entry(current_month)
-                timeline[current_month]['iacf_unfol'] += D(0)  # Use 0 for negative values
+            # 202502+: Use cumulative value directly as new amount (same as 202501)
+            get_or_create_month_entry(current_month)
+            timeline[current_month]['iacf_unfol'] += current_accumulated
         # Flows before 202412 are ignored for cash flow purposes, but included in amortization base logic.
 
     if not timeline:
